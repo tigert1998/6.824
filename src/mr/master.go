@@ -7,6 +7,7 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,13 +23,13 @@ const (
 	Reduce
 )
 
-type mapTask struct {
-	id       int32
-	filePath string
+type MapTask struct {
+	ID       int32
+	FilePath string
 }
 
 type mapTaskState struct {
-	task      mapTask
+	task      MapTask
 	progress  int32
 	startTime *time.Time
 }
@@ -36,34 +37,31 @@ type mapTaskState struct {
 type Master struct {
 	mtx sync.RWMutex
 
+	phase int32
+
 	mapTaskStates   []mapTaskState
 	mapTaskProgress [3]map[int32]struct{}
 
-	reduceFilePaths map[int32][]string
+	reduceFilePaths [][]string
 }
 
-func (m *Master) initMaster(filePaths []string) {
+func (m *Master) initMaster(filePaths []string, nReduce int) {
+	m.phase = Map
 	m.mapTaskStates = make([]mapTaskState, len(filePaths))
+	for i := 0; i < 3; i++ {
+		m.mapTaskProgress[i] = make(map[int32]struct{})
+	}
+
 	for i, filePath := range filePaths {
-		m.mapTaskStates[i].task.id = int32(i)
-		m.mapTaskStates[i].task.filePath = filePath
+		m.mapTaskStates[i].task.ID = int32(i)
+		m.mapTaskStates[i].task.FilePath = filePath
 		m.mapTaskStates[i].progress = Remaining
 		m.mapTaskProgress[Remaining][int32(i)] = struct{}{}
 	}
+	m.reduceFilePaths = make([][]string, nReduce)
 }
 
-func (m *Master) currentPhase() int32 {
-	m.mtx.RLock()
-	defer m.mtx.RUnlock()
-
-	if len(m.mapTaskProgress[Finished]) == len(m.mapTaskStates) {
-		return Reduce
-	} else {
-		return Map
-	}
-}
-
-func (m *Master) allocateMapTask() *mapTask {
+func (m *Master) allocateMapTask() *MapTask {
 	m.mtx.RLock()
 	if len(m.mapTaskProgress[Remaining]) == 0 {
 		defer m.mtx.RUnlock()
@@ -80,33 +78,44 @@ func (m *Master) allocateMapTask() *mapTask {
 		delete(m.mapTaskProgress[Remaining], key)
 		m.mapTaskProgress[Ongoing][key] = struct{}{}
 		m.mapTaskStates[key].progress = Ongoing
+		m.mapTaskStates[key].startTime = new(time.Time)
 		*m.mapTaskStates[key].startTime = time.Now()
 		return &m.mapTaskStates[key].task
 	}
 }
 
-func (m *Master) askForMapTask(args *interface{}, reply *askForMapTaskReply) error {
-	reply.mapPhaseFinished = m.currentPhase() == Reduce
-	reply.task = m.allocateMapTask()
+func (m *Master) InitializeWorker(args *struct{}, reply *InitializeWorkerReply) error {
+	reply.NReduce = int32(len(m.reduceFilePaths))
 	return nil
 }
 
-func (m *Master) finishMapTask(args *finishMapTaskArgs, reply *interface{}) error {
+func (m *Master) AskForMapTask(args *struct{}, reply *AskForMapTaskReply) error {
+	reply.MapPhaseFinished = atomic.LoadInt32(&m.phase) == Reduce
+	reply.Task = m.allocateMapTask()
+	return nil
+}
+
+func (m *Master) FinishMapTask(args *FinishMapTaskArgs, reply *struct{}) error {
 	m.mtx.RLock()
-	if m.mapTaskStates[args.mapID].progress != Ongoing {
+	if m.mapTaskStates[args.MapID].progress != Ongoing {
 		m.mtx.RUnlock()
 		return nil
 	} else {
 		m.mtx.RUnlock()
 		m.mtx.Lock()
-		defer m.mtx.Unlock()
 
-		delete(m.mapTaskProgress[Ongoing], args.mapID)
-		m.mapTaskProgress[Finished][args.mapID] = struct{}{}
-		m.mapTaskStates[args.mapID].progress = Finished
+		delete(m.mapTaskProgress[Ongoing], args.MapID)
+		m.mapTaskProgress[Finished][args.MapID] = struct{}{}
+		m.mapTaskStates[args.MapID].progress = Finished
 
-		for key, value := range args.reduceFilePaths {
-			m.reduceFilePaths[key] = append(m.reduceFilePaths[key], value...)
+		for key, value := range args.ReduceFilePaths {
+			m.reduceFilePaths[key] = append(m.reduceFilePaths[key], *value)
+		}
+
+		m.mtx.Unlock()
+
+		if len(m.mapTaskProgress[Finished]) == len(m.mapTaskStates) {
+			atomic.StoreInt32(&m.phase, Reduce)
 		}
 	}
 	return nil
@@ -146,7 +155,7 @@ func (m *Master) Done() bool {
 //
 func MakeMaster(filePaths []string, nReduce int) *Master {
 	m := Master{}
-	m.initMaster(filePaths)
+	m.initMaster(filePaths, nReduce)
 
 	m.server()
 	return &m

@@ -11,14 +11,18 @@ import (
 	"strconv"
 )
 
-type askForMapTaskReply struct {
-	mapPhaseFinished bool
-	task             *mapTask
+type InitializeWorkerReply struct {
+	NReduce int32
 }
 
-type finishMapTaskArgs struct {
-	mapID           int32
-	reduceFilePaths map[int32][]string
+type AskForMapTaskReply struct {
+	MapPhaseFinished bool
+	Task             *MapTask
+}
+
+type FinishMapTaskArgs struct {
+	MapID           int32
+	ReduceFilePaths []*string
 }
 
 // Cook up a unique-ish UNIX-domain socket name

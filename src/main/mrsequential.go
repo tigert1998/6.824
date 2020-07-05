@@ -18,7 +18,7 @@ import (
 )
 
 // for sorting by key.
-type ByKxey []mr.KeyValue
+type ByKey []mr.KeyValue
 
 // for sorting by key.
 func (a ByKey) Len() int           { return len(a) }
