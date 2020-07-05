@@ -1,15 +1,22 @@
 package kvraft
 
 import (
-	"6.824/labgob"
-	"6.824/labrpc"
-	"6.824/raft"
 	"log"
 	"sync"
 	"sync/atomic"
+
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
 )
 
 const Debug = false
+
+const (
+	PUT    = iota
+	APPEND = iota
+	GET    = iota
+)
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,11 +25,13 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Op    int
+	Key   string
+	Value string
 }
 
 type KVServer struct {
@@ -37,13 +46,29 @@ type KVServer struct {
 	// Your definitions here.
 }
 
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	_, _, ok := kv.rf.Start(Op{Op: GET, Key: args.Key, Value: ""})
+	if !ok {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	_ = <-kv.applyCh
+	reply.Err = OK
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	op := PUT
+	if args.Op == "Append" {
+		op = APPEND
+	}
+
+	_, _, ok := kv.rf.Start(Op{Op: op, Key: args.Key, Value: args.Value})
+	if !ok {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	_ = <-kv.applyCh
+	reply.Err = OK
 }
 
 //
@@ -90,12 +115,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	kv.dead = 0
 
 	return kv
 }
