@@ -1,10 +1,11 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -18,12 +19,11 @@ type KeyValue struct {
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
 //
-func ihash(key string) int {
+func ihash(key string) int32 {
 	h := fnv.New32a()
 	h.Write([]byte(key))
-	return int(h.Sum32() & 0x7fffffff)
+	return int32(h.Sum32() & 0x7fffffff)
 }
-
 
 //
 // main/mrworker.go calls this function.
@@ -31,34 +31,6 @@ func ihash(key string) int {
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
-
-}
-
-//
-// example function to show how to make an RPC call to the master.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
-
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
 }
 
 //

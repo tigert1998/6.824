@@ -1,29 +1,116 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
+import (
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+)
 
+// Map Task Progress
+const (
+	Remaining int32 = iota
+	Ongoing
+	Finished
+)
 
-type Master struct {
-	// Your definitions here.
+const (
+	Map int32 = iota
+	Reduce
+)
 
+type mapTask struct {
+	id       int32
+	filePath string
 }
 
-// Your code here -- RPC handlers for the worker to call.
+type mapTaskState struct {
+	task      mapTask
+	progress  int32
+	startTime *time.Time
+}
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+type Master struct {
+	mtx sync.RWMutex
+
+	mapTaskStates   []mapTaskState
+	mapTaskProgress [3]map[int32]struct{}
+
+	reduceFilePaths map[int32][]string
+}
+
+func (m *Master) initMaster(filePaths []string) {
+	m.mapTaskStates = make([]mapTaskState, len(filePaths))
+	for i, filePath := range filePaths {
+		m.mapTaskStates[i].task.id = int32(i)
+		m.mapTaskStates[i].task.filePath = filePath
+		m.mapTaskStates[i].progress = Remaining
+		m.mapTaskProgress[Remaining][int32(i)] = struct{}{}
+	}
+}
+
+func (m *Master) currentPhase() int32 {
+	m.mtx.RLock()
+	defer m.mtx.RUnlock()
+
+	if len(m.mapTaskProgress[Finished]) == len(m.mapTaskStates) {
+		return Reduce
+	} else {
+		return Map
+	}
+}
+
+func (m *Master) allocateMapTask() *mapTask {
+	m.mtx.RLock()
+	if len(m.mapTaskProgress[Remaining]) == 0 {
+		defer m.mtx.RUnlock()
+		return nil
+	} else {
+		m.mtx.RUnlock()
+		m.mtx.Lock()
+		defer m.mtx.Unlock()
+
+		var key int32
+		for key = range m.mapTaskProgress[Remaining] {
+			break
+		}
+		delete(m.mapTaskProgress[Remaining], key)
+		m.mapTaskProgress[Ongoing][key] = struct{}{}
+		m.mapTaskStates[key].progress = Ongoing
+		*m.mapTaskStates[key].startTime = time.Now()
+		return &m.mapTaskStates[key].task
+	}
+}
+
+func (m *Master) askForMapTask(args *interface{}, reply *askForMapTaskReply) error {
+	reply.mapPhaseFinished = m.currentPhase() == Reduce
+	reply.task = m.allocateMapTask()
 	return nil
 }
 
+func (m *Master) finishMapTask(args *finishMapTaskArgs, reply *interface{}) error {
+	m.mtx.RLock()
+	if m.mapTaskStates[args.mapID].progress != Ongoing {
+		m.mtx.RUnlock()
+		return nil
+	} else {
+		m.mtx.RUnlock()
+		m.mtx.Lock()
+		defer m.mtx.Unlock()
+
+		delete(m.mapTaskProgress[Ongoing], args.mapID)
+		m.mapTaskProgress[Finished][args.mapID] = struct{}{}
+		m.mapTaskStates[args.mapID].progress = Finished
+
+		for key, value := range args.reduceFilePaths {
+			m.reduceFilePaths[key] = append(m.reduceFilePaths[key], value...)
+		}
+	}
+	return nil
+}
 
 //
 // start a thread that listens for RPCs from worker.go
@@ -31,7 +118,6 @@ func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
 func (m *Master) server() {
 	rpc.Register(m)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
 	sockname := masterSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
@@ -50,7 +136,6 @@ func (m *Master) Done() bool {
 
 	// Your code here.
 
-
 	return ret
 }
 
@@ -59,11 +144,9 @@ func (m *Master) Done() bool {
 // main/mrmaster.go calls this function.
 // nReduce is the number of reduce tasks to use.
 //
-func MakeMaster(files []string, nReduce int) *Master {
+func MakeMaster(filePaths []string, nReduce int) *Master {
 	m := Master{}
-
-	// Your code here.
-
+	m.initMaster(filePaths)
 
 	m.server()
 	return &m
