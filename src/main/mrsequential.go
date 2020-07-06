@@ -17,14 +17,6 @@ import (
 	"../mr"
 )
 
-// for sorting by key.
-type ByKey []mr.KeyValue
-
-// for sorting by key.
-func (a ByKey) Len() int           { return len(a) }
-func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
-
 func main() {
 	if len(os.Args) < 3 {
 		fmt.Fprintf(os.Stderr, "Usage: mrsequential xxx.so inputfiles...\n")
@@ -59,7 +51,7 @@ func main() {
 	// rather than being partitioned into NxM buckets.
 	//
 
-	sort.Sort(ByKey(intermediate))
+	sort.Sort(mr.ByKey(intermediate))
 
 	oname := "mr-out-0"
 	ofile, _ := os.Create(oname)

@@ -1,12 +1,14 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"time"
 )
 
@@ -20,6 +22,12 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -43,20 +51,23 @@ func executeMap(task MapTask, mapf func(string, string) []KeyValue) []*string {
 	file.Close()
 	kva := mapf(task.FilePath, string(content))
 
+	encoders := make([]*json.Encoder, nReduce)
 	files := make([]*os.File, nReduce)
 	filePaths := make([]*string, nReduce)
+
 	for _, kv := range kva {
 		idx := ihash(kv.Key) % nReduce
-		if files[idx] == nil {
+		if filePaths[idx] == nil {
 			filePaths[idx] = new(string)
 			*filePaths[idx] = fmt.Sprintf("mr-%v-%v-%v", pid, task.ID, idx)
 			files[idx], err = os.Create(*filePaths[idx])
 			if err != nil {
 				log.Fatalf("cannot write %v", *filePaths[idx])
 			}
+			encoders[idx] = json.NewEncoder(files[idx])
 		}
 
-		files[idx].WriteString(fmt.Sprintf("%v %v\n", kv.Key, kv.Value))
+		encoders[idx].Encode(&kv)
 	}
 
 	for i := 0; i < int(nReduce); i++ {
@@ -66,6 +77,55 @@ func executeMap(task MapTask, mapf func(string, string) []KeyValue) []*string {
 	}
 
 	return filePaths
+}
+
+func executeReduce(task ReduceTask, reducef func(string, []string) string) string {
+	var kva ByKey
+	for _, filePath := range task.FilePaths {
+		file, err := os.Open(filePath)
+		if err != nil {
+			log.Fatalf("cannot open %v", filePath)
+		}
+
+		decoder := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := decoder.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+
+		file.Close()
+	}
+
+	sort.Sort(kva)
+
+	filePath := fmt.Sprintf("mr-out-%v-%v", pid, task.ID)
+	file, err := os.Create(filePath)
+	if err != nil {
+		log.Fatalf("cannot create %v", filePath)
+	}
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+		file.WriteString(fmt.Sprintf("%v %v\n", kva[i].Key, output))
+
+		i = j
+	}
+
+	file.Close()
+
+	return filePath
 }
 
 //
@@ -91,6 +151,23 @@ func Worker(mapf func(string, string) []KeyValue,
 					ReduceFilePaths: executeMap(*reply.Task, mapf),
 				}
 				for !call("Master.FinishMapTask", &args, &(struct{}{})) {
+				}
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	for {
+		reply := AskForReduceTaskReply{}
+		if call("Master.AskForReduceTask", &(struct{}{}), &reply) {
+			if reply.ReducePhaseFinished {
+				break
+			} else if reply.Task != nil {
+				args := FinishReduceTaskArgs{
+					ReduceID: reply.Task.ID,
+					FilePath: executeReduce(*reply.Task, reducef),
+				}
+				for !call("Master.FinishReduceTask", &args, &(struct{}{})) {
 				}
 			}
 		}

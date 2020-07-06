@@ -40,12 +40,6 @@ func (task *ReduceTask) UpdateContent(filePath *string) {
 	}
 }
 
-const (
-	Remaining int32 = iota
-	Ongoing
-	Finished
-)
-
 type progressMap [3]map[int32]struct{}
 
 func (m *progressMap) flip(idx int32, from int32, to int32) {
@@ -105,5 +99,24 @@ func (manager *taskManager) allocateTask(mtx *sync.RWMutex) task {
 		manager.progress[key] = Ongoing
 		manager.startTime[key] = time.Now()
 		return manager.task[key]
+	}
+}
+
+func (manager *taskManager) finishTask(mtx *sync.RWMutex, idx int32, callback func()) {
+	mtx.RLock()
+	if manager.progress[idx] != Ongoing {
+		mtx.RUnlock()
+	} else {
+		mtx.RUnlock()
+		mtx.Lock()
+		defer mtx.Unlock()
+
+		if manager.progress[idx] != Ongoing {
+			return
+		}
+		manager.progressMap.flip(idx, Ongoing, Finished)
+		manager.progress[idx] = Finished
+
+		callback()
 	}
 }

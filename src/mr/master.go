@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -11,59 +12,69 @@ import (
 )
 
 const (
-	Map int32 = iota
-	Reduce
+	Remaining = 0
+	Map       = 0
+	Ongoing   = 1
+	Reduce    = 1
+	Finished  = 2
 )
 
+type MapReduceConfig struct {
+	nMap    int32
+	nReduce int32
+}
+
 type Master struct {
+	config MapReduceConfig
+
 	mtx sync.RWMutex
 
 	phase int32
 
 	mapTaskManager    taskManager
 	reduceTaskManager taskManager
+
+	outputs []string
 }
 
 func (m *Master) initializeMaster(filePaths []string, nReduce int32) {
+	m.config = MapReduceConfig{nMap: int32(len(filePaths)), nReduce: nReduce}
 	m.phase = Map
 
 	m.mapTaskManager.initialize(Map, int32(len(filePaths)))
 	m.reduceTaskManager.initialize(Reduce, nReduce)
 
+	m.outputs = make([]string, nReduce)
 	for i := 0; i < len(filePaths); i++ {
 		m.mapTaskManager.task[i].UpdateContent(&filePaths[i])
 	}
 }
 
 func (m *Master) InitializeWorker(args *struct{}, reply *InitializeWorkerReply) error {
-	reply.NReduce = int32(len(m.reduceTaskManager.task))
+	reply.NReduce = m.config.nReduce
 	return nil
 }
 
 func (m *Master) AskForMapTask(args *struct{}, reply *AskForMapTaskReply) error {
-	reply.MapPhaseFinished = atomic.LoadInt32(&m.phase) == Reduce
-	task := m.mapTaskManager.allocateTask(&m.mtx)
-	if task == nil {
-		reply.Task = nil
-	} else {
-		reply.Task = task.(*MapTask)
+	currentPhase := atomic.LoadInt32(&m.phase)
+
+	reply.MapPhaseFinished = currentPhase > Map
+	reply.Task = nil
+	if currentPhase == Map {
+		task := m.mapTaskManager.allocateTask(&m.mtx)
+		if task != nil {
+			reply.Task = task.(*MapTask)
+		}
 	}
 	return nil
 }
 
 func (m *Master) FinishMapTask(args *FinishMapTaskArgs, reply *struct{}) error {
-	m.mtx.RLock()
-	if m.mapTaskManager.progress[args.MapID] != Ongoing {
-		m.mtx.RUnlock()
+	if atomic.LoadInt32(&m.phase) != Map {
 		return nil
-	} else {
-		m.mtx.RUnlock()
-		m.mtx.Lock()
-		defer m.mtx.Unlock()
+	}
 
-		m.mapTaskManager.progressMap.flip(args.MapID, Ongoing, Finished)
-		m.mapTaskManager.progress[args.MapID] = Finished
-
+	m.mapTaskManager.finishTask(&m.mtx, args.MapID, func() {
 		for key, value := range args.ReduceFilePaths {
 			m.reduceTaskManager.task[key].UpdateContent(value)
 		}
@@ -71,16 +82,43 @@ func (m *Master) FinishMapTask(args *FinishMapTaskArgs, reply *struct{}) error {
 		if len(m.mapTaskManager.progressMap[Finished]) == len(m.mapTaskManager.task) {
 			atomic.StoreInt32(&m.phase, Reduce)
 		}
-	}
+	})
+
 	return nil
 }
 
 func (m *Master) AskForReduceTask(args *struct{}, reply *AskForReduceTaskReply) error {
-	if atomic.LoadInt32(&m.phase) == Reduce {
-		reply.Task = m.reduceTaskManager.allocateTask(&m.mtx).(*ReduceTask)
-	} else {
-		reply.Task = nil
+	currentPhase := atomic.LoadInt32(&m.phase)
+
+	reply.ReducePhaseFinished = currentPhase > Reduce
+	reply.Task = nil
+	if currentPhase == Reduce {
+		task := m.reduceTaskManager.allocateTask(&m.mtx)
+		if task != nil {
+			reply.Task = task.(*ReduceTask)
+		}
 	}
+	return nil
+}
+
+func (m *Master) FinishReduceTask(args *FinishReduceTaskArgs, reply *struct{}) error {
+	if atomic.LoadInt32(&m.phase) != Reduce {
+		return nil
+	}
+
+	m.reduceTaskManager.finishTask(&m.mtx, args.ReduceID, func() {
+		m.outputs[args.ReduceID] = args.FilePath
+
+		if len(m.reduceTaskManager.progressMap[Finished]) == len(m.reduceTaskManager.task) {
+			for i := 0; int32(i) < m.config.nReduce; i++ {
+				newFilePath := fmt.Sprintf("mr-out-%v", i)
+				os.Rename(m.outputs[i], newFilePath)
+				m.outputs[i] = newFilePath
+			}
+			atomic.StoreInt32(&m.phase, Finished)
+		}
+	})
+
 	return nil
 }
 
@@ -104,9 +142,7 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := atomic.LoadInt32(&m.phase) == Reduce
-
-	return ret
+	return atomic.LoadInt32(&m.phase) == Finished
 }
 
 //

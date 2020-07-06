@@ -26,7 +26,13 @@ type FinishMapTaskArgs struct {
 }
 
 type AskForReduceTaskReply struct {
-	Task *ReduceTask
+	ReducePhaseFinished bool
+	Task                *ReduceTask
+}
+
+type FinishReduceTaskArgs struct {
+	ReduceID int32
+	FilePath string
 }
 
 // Cook up a unique-ish UNIX-domain socket name
