@@ -43,7 +43,7 @@ func ihash(key string) int32 {
 	return int32(h.Sum32() & 0x7fffffff)
 }
 
-func executeMap(task MapTask, mapf func(string, string) []KeyValue) []*string {
+func executeMap(task MapTask, mapf func(string, string) []KeyValue) map[int32]string {
 	file, err := os.Open(task.FilePath)
 	if err != nil {
 		log.Fatalf("%v cannot open %v", I(), task.FilePath)
@@ -74,13 +74,15 @@ func executeMap(task MapTask, mapf func(string, string) []KeyValue) []*string {
 		encoders[idx].Encode(&kv)
 	}
 
+	ret := make(map[int32]string)
 	for i := 0; i < int(nReduce); i++ {
 		if files[i] != nil {
 			files[i].Close()
+			ret[int32(i)] = *filePaths[i]
 		}
 	}
 
-	return filePaths
+	return ret
 }
 
 func executeReduce(task ReduceTask, reducef func(string, []string) string) string {
@@ -157,6 +159,7 @@ func Worker(mapf func(string, string) []KeyValue,
 					MapID:           reply.Task.ID,
 					ReduceFilePaths: executeMap(*reply.Task, mapf),
 				}
+
 				for i := 0; i < 10 && !call("Master.FinishMapTask", &args, &emptyStruct); i++ {
 					time.Sleep(100 * time.Millisecond)
 				}

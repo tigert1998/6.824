@@ -104,7 +104,7 @@ func (m *Master) FinishMapTask(args *FinishMapTaskArgs, reply *struct{}) error {
 
 	m.mapTaskManager.finishTask(&m.mtx, args.MapID, func() {
 		for key, value := range args.ReduceFilePaths {
-			m.reduceTaskManager.task[key].UpdateContent(value)
+			m.reduceTaskManager.task[key].UpdateContent(&value)
 		}
 
 		log.Printf("Map task %v has been finished", args.MapID)

@@ -22,7 +22,7 @@ type AskForMapTaskReply struct {
 
 type FinishMapTaskArgs struct {
 	MapID           int32
-	ReduceFilePaths []*string
+	ReduceFilePaths map[int32]string
 }
 
 type AskForReduceTaskReply struct {
