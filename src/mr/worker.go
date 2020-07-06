@@ -10,6 +10,9 @@ import (
 	"time"
 )
 
+var nReduce int32
+var pid int
+
 //
 // Map functions return a slice of KeyValue.
 //
@@ -28,8 +31,7 @@ func ihash(key string) int32 {
 	return int32(h.Sum32() & 0x7fffffff)
 }
 
-func executeMap(nReduce int32, task MapTask, mapf func(string, string) []KeyValue) []*string {
-	pid := os.Getpid()
+func executeMap(task MapTask, mapf func(string, string) []KeyValue) []*string {
 	file, err := os.Open(task.FilePath)
 	if err != nil {
 		log.Fatalf("cannot open %v", task.FilePath)
@@ -73,28 +75,26 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	reply := InitializeWorkerReply{}
-	call("Master.InitializeWorker", &(struct{}{}), &reply)
-	nReduce := reply.NReduce
+	for !call("Master.InitializeWorker", &(struct{}{}), &reply) {
+	}
+	nReduce = reply.NReduce
+	pid = os.Getpid()
 
 	for {
-		time.Sleep(500 * time.Millisecond)
 		reply := AskForMapTaskReply{}
 		if call("Master.AskForMapTask", &(struct{}{}), &reply) {
 			if reply.MapPhaseFinished {
 				break
-			} else if reply.Task == nil {
-				continue
-			} else {
+			} else if reply.Task != nil {
 				args := FinishMapTaskArgs{
 					MapID:           reply.Task.ID,
-					ReduceFilePaths: executeMap(nReduce, *reply.Task, mapf),
+					ReduceFilePaths: executeMap(*reply.Task, mapf),
 				}
-				for call("Master.FinishMapTask", &args, &(struct{}{})) == false {
+				for !call("Master.FinishMapTask", &args, &(struct{}{})) {
 				}
 			}
-		} else {
-			continue
 		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
