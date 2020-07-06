@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -19,9 +20,9 @@ const (
 	Finished  = 2
 )
 
-type phase int32
+type Phase int32
 
-func (p phase) String() string {
+func (p Phase) String() string {
 	if p == Map {
 		return "Map"
 	} else if p == Reduce {
@@ -34,8 +35,9 @@ func (p phase) String() string {
 }
 
 type MapReduceConfig struct {
-	nMap    int32
-	nReduce int32
+	nMap                  int32
+	nReduce               int32
+	workerMaxLostDuration time.Duration
 }
 
 type Master struct {
@@ -43,7 +45,7 @@ type Master struct {
 
 	mtx sync.RWMutex
 
-	phase phase
+	phase Phase
 
 	mapTaskManager    taskManager
 	reduceTaskManager taskManager
@@ -55,8 +57,8 @@ func (m *Master) storePhase(to int32) {
 	atomic.StoreInt32((*int32)(&m.phase), to)
 }
 
-func (m *Master) getPhase() phase {
-	return phase(atomic.LoadInt32((*int32)(&m.phase)))
+func (m *Master) getPhase() Phase {
+	return Phase(atomic.LoadInt32((*int32)(&m.phase)))
 }
 
 func (m *Master) logPhase() {
@@ -64,7 +66,11 @@ func (m *Master) logPhase() {
 }
 
 func (m *Master) initializeMaster(filePaths []string, nReduce int32) {
-	m.config = MapReduceConfig{nMap: int32(len(filePaths)), nReduce: nReduce}
+	m.config = MapReduceConfig{
+		nMap:                  int32(len(filePaths)),
+		nReduce:               nReduce,
+		workerMaxLostDuration: 5 * time.Second,
+	}
 	m.phase = Map
 
 	m.mapTaskManager.initialize(Map, int32(len(filePaths)))
@@ -156,6 +162,20 @@ func (m *Master) FinishReduceTask(args *FinishReduceTaskArgs, reply *struct{}) e
 	return nil
 }
 
+func (m *Master) Ping(args *PingArgs, reply *struct{}) error {
+	if m.getPhase() != args.Phase {
+		return nil
+	}
+
+	if args.Phase == Map {
+		m.mapTaskManager.lastPing[args.ID].Store(time.Now())
+	} else if args.Phase == Reduce {
+		m.reduceTaskManager.lastPing[args.ID].Store(time.Now())
+	}
+
+	return nil
+}
+
 //
 // start a thread that listens for RPCs from worker.go
 //
@@ -169,6 +189,18 @@ func (m *Master) server() {
 		log.Fatal("listen error:", e)
 	}
 	go http.Serve(l, nil)
+}
+
+func (m *Master) checkPing() {
+	for !m.Done() {
+		switch m.getPhase() {
+		case Map:
+			m.mapTaskManager.checkAlive(&m.mtx, m.config.workerMaxLostDuration)
+		case Reduce:
+			m.reduceTaskManager.checkAlive(&m.mtx, m.config.workerMaxLostDuration)
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 //
@@ -188,6 +220,7 @@ func MakeMaster(filePaths []string, nReduce int) *Master {
 	m := Master{}
 	m.initializeMaster(filePaths, int32(nReduce))
 
+	go m.checkPing()
 	m.server()
 	return &m
 }

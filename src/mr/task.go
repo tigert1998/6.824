@@ -2,6 +2,7 @@ package mr
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -59,7 +60,7 @@ func (m *progressMap) initialize(n int32) {
 type taskManager struct {
 	task        []task
 	progress    []int32
-	startTime   []time.Time
+	lastPing    []atomic.Value
 	progressMap progressMap
 }
 
@@ -73,7 +74,7 @@ func (manager *taskManager) initialize(phase int32, n int32) {
 		}
 	}
 	manager.progress = make([]int32, n)
-	manager.startTime = make([]time.Time, n)
+	manager.lastPing = make([]atomic.Value, n)
 	manager.progressMap.initialize(n)
 
 	for i := 0; int32(i) < n; i++ {
@@ -97,7 +98,7 @@ func (manager *taskManager) allocateTask(mtx *sync.RWMutex) task {
 		}
 		manager.progressMap.flip(key, Remaining, Ongoing)
 		manager.progress[key] = Ongoing
-		manager.startTime[key] = time.Now()
+		manager.lastPing[key].Store(time.Now())
 		return manager.task[key]
 	}
 }
@@ -118,5 +119,22 @@ func (manager *taskManager) finishTask(mtx *sync.RWMutex, idx int32, callback fu
 		manager.progress[idx] = Finished
 
 		callback()
+	}
+}
+
+func (manager *taskManager) checkAlive(mtx *sync.RWMutex, limit time.Duration) {
+	mtx.Lock()
+	defer mtx.Unlock()
+
+	tp := time.Now()
+	for i := 0; i < len(manager.lastPing); i++ {
+		if manager.progress[i] != Ongoing {
+			continue
+		}
+		lastPing := manager.lastPing[i].Load().(time.Time)
+		if tp.Sub(lastPing) > limit {
+			manager.progress[i] = Remaining
+			manager.progressMap.flip(int32(i), Ongoing, Remaining)
+		}
 	}
 }

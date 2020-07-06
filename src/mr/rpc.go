@@ -35,6 +35,11 @@ type FinishReduceTaskArgs struct {
 	FilePath string
 }
 
+type PingArgs struct {
+	Phase Phase
+	ID    int32
+}
+
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.
 // Can't use the current directory since
