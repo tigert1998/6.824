@@ -15,6 +15,10 @@ import (
 var nReduce int32
 var pid int
 
+func I() string {
+	return fmt.Sprintf("Worker (%v)", pid)
+}
+
 //
 // Map functions return a slice of KeyValue.
 //
@@ -42,11 +46,11 @@ func ihash(key string) int32 {
 func executeMap(task MapTask, mapf func(string, string) []KeyValue) []*string {
 	file, err := os.Open(task.FilePath)
 	if err != nil {
-		log.Fatalf("cannot open %v", task.FilePath)
+		log.Fatalf("%v cannot open %v", I(), task.FilePath)
 	}
 	content, err := ioutil.ReadAll(file)
 	if err != nil {
-		log.Fatalf("cannot read %v", task.FilePath)
+		log.Fatalf("%v cannot read %v", I(), task.FilePath)
 	}
 	file.Close()
 	kva := mapf(task.FilePath, string(content))
@@ -62,7 +66,7 @@ func executeMap(task MapTask, mapf func(string, string) []KeyValue) []*string {
 			*filePaths[idx] = fmt.Sprintf("mr-%v-%v-%v", pid, task.ID, idx)
 			files[idx], err = os.Create(*filePaths[idx])
 			if err != nil {
-				log.Fatalf("cannot write %v", *filePaths[idx])
+				log.Fatalf("%v cannot create %v", I(), *filePaths[idx])
 			}
 			encoders[idx] = json.NewEncoder(files[idx])
 		}
@@ -84,7 +88,7 @@ func executeReduce(task ReduceTask, reducef func(string, []string) string) strin
 	for _, filePath := range task.FilePaths {
 		file, err := os.Open(filePath)
 		if err != nil {
-			log.Fatalf("cannot open %v", filePath)
+			log.Fatalf("%v cannot open %v", I(), filePath)
 		}
 
 		decoder := json.NewDecoder(file)
@@ -104,7 +108,7 @@ func executeReduce(task ReduceTask, reducef func(string, []string) string) strin
 	filePath := fmt.Sprintf("mr-out-%v-%v", pid, task.ID)
 	file, err := os.Create(filePath)
 	if err != nil {
-		log.Fatalf("cannot create %v", filePath)
+		log.Fatalf("%v cannot create %v", I(), filePath)
 	}
 
 	i := 0
@@ -134,15 +138,18 @@ func executeReduce(task ReduceTask, reducef func(string, []string) string) strin
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
+	emptyStruct := struct{}{}
+
 	reply := InitializeWorkerReply{}
-	for !call("Master.InitializeWorker", &(struct{}{}), &reply) {
+	for !call("Master.InitializeWorker", &emptyStruct, &reply) {
+		time.Sleep(100 * time.Millisecond)
 	}
 	nReduce = reply.NReduce
 	pid = os.Getpid()
 
 	for {
 		reply := AskForMapTaskReply{}
-		if call("Master.AskForMapTask", &(struct{}{}), &reply) {
+		if call("Master.AskForMapTask", &emptyStruct, &reply) {
 			if reply.MapPhaseFinished {
 				break
 			} else if reply.Task != nil {
@@ -150,16 +157,17 @@ func Worker(mapf func(string, string) []KeyValue,
 					MapID:           reply.Task.ID,
 					ReduceFilePaths: executeMap(*reply.Task, mapf),
 				}
-				for !call("Master.FinishMapTask", &args, &(struct{}{})) {
+				for i := 0; i < 10 && !call("Master.FinishMapTask", &args, &emptyStruct); i++ {
+					time.Sleep(100 * time.Millisecond)
 				}
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	for {
 		reply := AskForReduceTaskReply{}
-		if call("Master.AskForReduceTask", &(struct{}{}), &reply) {
+		if call("Master.AskForReduceTask", &emptyStruct, &reply) {
 			if reply.ReducePhaseFinished {
 				break
 			} else if reply.Task != nil {
@@ -167,11 +175,12 @@ func Worker(mapf func(string, string) []KeyValue,
 					ReduceID: reply.Task.ID,
 					FilePath: executeReduce(*reply.Task, reducef),
 				}
-				for !call("Master.FinishReduceTask", &args, &(struct{}{})) {
+				for i := 0; i < 10 && !call("Master.FinishReduceTask", &args, &emptyStruct); i++ {
+					time.Sleep(100 * time.Millisecond)
 				}
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 

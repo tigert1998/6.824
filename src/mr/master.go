@@ -19,6 +19,20 @@ const (
 	Finished  = 2
 )
 
+type phase int32
+
+func (p phase) String() string {
+	if p == Map {
+		return "Map"
+	} else if p == Reduce {
+		return "Reduce"
+	} else if p == Finished {
+		return "Finished"
+	} else {
+		return "Undefined"
+	}
+}
+
 type MapReduceConfig struct {
 	nMap    int32
 	nReduce int32
@@ -29,12 +43,24 @@ type Master struct {
 
 	mtx sync.RWMutex
 
-	phase int32
+	phase phase
 
 	mapTaskManager    taskManager
 	reduceTaskManager taskManager
 
 	outputs []string
+}
+
+func (m *Master) storePhase(to int32) {
+	atomic.StoreInt32((*int32)(&m.phase), to)
+}
+
+func (m *Master) getPhase() phase {
+	return phase(atomic.LoadInt32((*int32)(&m.phase)))
+}
+
+func (m *Master) logPhase() {
+	log.Printf("%v phase started", m.getPhase())
 }
 
 func (m *Master) initializeMaster(filePaths []string, nReduce int32) {
@@ -48,6 +74,8 @@ func (m *Master) initializeMaster(filePaths []string, nReduce int32) {
 	for i := 0; i < len(filePaths); i++ {
 		m.mapTaskManager.task[i].UpdateContent(&filePaths[i])
 	}
+
+	m.logPhase()
 }
 
 func (m *Master) InitializeWorker(args *struct{}, reply *InitializeWorkerReply) error {
@@ -56,7 +84,7 @@ func (m *Master) InitializeWorker(args *struct{}, reply *InitializeWorkerReply) 
 }
 
 func (m *Master) AskForMapTask(args *struct{}, reply *AskForMapTaskReply) error {
-	currentPhase := atomic.LoadInt32(&m.phase)
+	currentPhase := m.getPhase()
 
 	reply.MapPhaseFinished = currentPhase > Map
 	reply.Task = nil
@@ -70,7 +98,7 @@ func (m *Master) AskForMapTask(args *struct{}, reply *AskForMapTaskReply) error 
 }
 
 func (m *Master) FinishMapTask(args *FinishMapTaskArgs, reply *struct{}) error {
-	if atomic.LoadInt32(&m.phase) != Map {
+	if m.getPhase() != Map {
 		return nil
 	}
 
@@ -79,8 +107,11 @@ func (m *Master) FinishMapTask(args *FinishMapTaskArgs, reply *struct{}) error {
 			m.reduceTaskManager.task[key].UpdateContent(value)
 		}
 
+		log.Printf("Map task %v has been finished", args.MapID)
+
 		if len(m.mapTaskManager.progressMap[Finished]) == len(m.mapTaskManager.task) {
-			atomic.StoreInt32(&m.phase, Reduce)
+			m.storePhase(Reduce)
+			m.logPhase()
 		}
 	})
 
@@ -88,7 +119,7 @@ func (m *Master) FinishMapTask(args *FinishMapTaskArgs, reply *struct{}) error {
 }
 
 func (m *Master) AskForReduceTask(args *struct{}, reply *AskForReduceTaskReply) error {
-	currentPhase := atomic.LoadInt32(&m.phase)
+	currentPhase := m.getPhase()
 
 	reply.ReducePhaseFinished = currentPhase > Reduce
 	reply.Task = nil
@@ -102,12 +133,14 @@ func (m *Master) AskForReduceTask(args *struct{}, reply *AskForReduceTaskReply) 
 }
 
 func (m *Master) FinishReduceTask(args *FinishReduceTaskArgs, reply *struct{}) error {
-	if atomic.LoadInt32(&m.phase) != Reduce {
+	if m.getPhase() != Reduce {
 		return nil
 	}
 
 	m.reduceTaskManager.finishTask(&m.mtx, args.ReduceID, func() {
 		m.outputs[args.ReduceID] = args.FilePath
+
+		log.Printf("Reduce task %v has been finished", args.ReduceID)
 
 		if len(m.reduceTaskManager.progressMap[Finished]) == len(m.reduceTaskManager.task) {
 			for i := 0; int32(i) < m.config.nReduce; i++ {
@@ -115,7 +148,8 @@ func (m *Master) FinishReduceTask(args *FinishReduceTaskArgs, reply *struct{}) e
 				os.Rename(m.outputs[i], newFilePath)
 				m.outputs[i] = newFilePath
 			}
-			atomic.StoreInt32(&m.phase, Finished)
+			m.storePhase(Finished)
+			m.logPhase()
 		}
 	})
 
@@ -142,7 +176,7 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	return atomic.LoadInt32(&m.phase) == Finished
+	return m.getPhase() == Finished
 }
 
 //
