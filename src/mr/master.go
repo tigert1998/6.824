@@ -113,8 +113,6 @@ func (m *Master) FinishMapTask(args *FinishMapTaskArgs, reply *struct{}) error {
 			m.reduceTaskManager.task[key].UpdateContent(&value)
 		}
 
-		log.Printf("Map task %v has been finished", args.MapID)
-
 		if len(m.mapTaskManager.progressMap[Finished]) == len(m.mapTaskManager.task) {
 			m.storePhase(Reduce)
 			m.logPhase()
@@ -145,8 +143,6 @@ func (m *Master) FinishReduceTask(args *FinishReduceTaskArgs, reply *struct{}) e
 
 	m.reduceTaskManager.finishTask(&m.mtx, args.ReduceID, func() {
 		m.outputs[args.ReduceID] = args.FilePath
-
-		log.Printf("Reduce task %v has been finished", args.ReduceID)
 
 		if len(m.reduceTaskManager.progressMap[Finished]) == len(m.reduceTaskManager.task) {
 			for i := 0; int32(i) < m.config.nReduce; i++ {

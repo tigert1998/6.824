@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -58,13 +59,15 @@ func (m *progressMap) initialize(n int32) {
 }
 
 type taskManager struct {
+	phase       Phase
 	task        []task
 	progress    []int32
 	lastPing    []atomic.Value
 	progressMap progressMap
 }
 
-func (manager *taskManager) initialize(phase int32, n int32) {
+func (manager *taskManager) initialize(phase Phase, n int32) {
+	manager.phase = phase
 	manager.task = make([]task, n)
 	for i := 0; int32(i) < n; i++ {
 		if phase == Map {
@@ -118,6 +121,8 @@ func (manager *taskManager) finishTask(mtx *sync.RWMutex, idx int32, callback fu
 		manager.progressMap.flip(idx, Ongoing, Finished)
 		manager.progress[idx] = Finished
 
+		log.Printf("%v task %v completed", manager.phase, idx)
+
 		callback()
 	}
 }
@@ -135,6 +140,8 @@ func (manager *taskManager) checkAlive(mtx *sync.RWMutex, limit time.Duration) {
 		if tp.Sub(lastPing) > limit {
 			manager.progress[i] = Remaining
 			manager.progressMap.flip(int32(i), Ongoing, Remaining)
+
+			log.Printf("%v task %v reset", manager.phase, i)
 		}
 	}
 }
