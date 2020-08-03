@@ -207,6 +207,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 	}
+
+	if reply.VoteGranted {
+		log.Printf("[term #%v] [%v] <- [%v]", args.Term, args.CandidateID, rf.me)
+	}
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -313,7 +317,8 @@ func (rf *Raft) campaign() {
 		if rf.role == CANDIDATE {
 			log.Printf("[%v] previous election tied. election restarts", rf.me)
 		} else if rf.role == LEADER {
-			log.Fatalf("[%v] invalid role in the beginning of the campaign: role == LEADER", rf.me)
+			rf.roleMtx.Unlock()
+			return
 		}
 		rf.votedFor = rf.me
 		rf.currentTerm++
@@ -322,7 +327,7 @@ func (rf *Raft) campaign() {
 
 		rf.roleMtx.Unlock()
 	}
-	log.Printf("[%v] starts election for term #%v", rf.me, campaignTerm)
+	log.Printf("[term #%v] [%v] starts election", campaignTerm, rf.me)
 
 	lastLogIndex, lastLogTerm := rf.getLogIndexTerm(-1)
 
@@ -332,12 +337,8 @@ func (rf *Raft) campaign() {
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
-	reply := RequestVoteReply{}
 
-	ch := make(chan int, len(rf.peers))
-	totThreads := 0
-
-	numVotes := 1
+	var numVotes int32 = 1
 	for i := 0; i < len(rf.peers); i++ {
 		if rf.killed() {
 			return
@@ -350,24 +351,28 @@ func (rf *Raft) campaign() {
 			continue
 		}
 
-		totThreads++
 		go func(target int) {
 			var role, term int
 
-			for !rf.peers[target].Call("Raft.RequestVote", &args, &reply) {
-				role, term, _ = rf.getRoleTermVote()
+			reply := RequestVoteReply{}
+
+			RETRIES := 5
+			var i int
+			for i = 0; i < RETRIES && !rf.peers[target].Call("Raft.RequestVote", &args, &reply); i++ {
 				if rf.killed() {
 					return
 				}
-				if role != CANDIDATE || campaignTerm < term {
+				role, term, _ = rf.getRoleTermVote()
+				if campaignTerm < term || role != CANDIDATE {
 					return
 				}
-				time.Sleep(25 * time.Millisecond)
+			}
+			if i >= RETRIES {
+				return
 			}
 
 			if reply.VoteGranted {
-				numVotes++
-				if numVotes >= rf.majority() {
+				if atomic.AddInt32(&numVotes, 1) >= int32(rf.majority()) {
 					rf.roleMtx.Lock()
 					if rf.role == FOLLOWER && campaignTerm < rf.currentTerm {
 						// do nothing, simply give up
@@ -387,12 +392,7 @@ func (rf *Raft) campaign() {
 				}
 				rf.roleMtx.Unlock()
 			}
-			ch <- 0
 		}(i)
-	}
-
-	for i := 0; i < totThreads; i++ {
-		<-ch
 	}
 }
 
@@ -414,10 +414,6 @@ func (rf *Raft) sendHeartBeat() {
 	}
 	rf.roleMtx.RUnlock()
 
-	reply := AppendEntriesReply{}
-
-	var wg sync.WaitGroup
-	wg.Add(len(rf.peers) - 1)
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -427,11 +423,20 @@ func (rf *Raft) sendHeartBeat() {
 		}
 
 		go func(target int) {
-			rf.peers[target].Call("Raft.AppendEntries", &args, &reply)
-			wg.Done()
+			reply := AppendEntriesReply{}
+			if !rf.peers[target].Call("Raft.AppendEntries", &args, &reply) {
+				return
+			}
+			rf.roleMtx.Lock()
+			defer rf.roleMtx.Unlock()
+
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.role = FOLLOWER
+				rf.votedFor = -1
+			}
 		}(i)
 	}
-	wg.Wait()
 }
 
 func (rf *Raft) checkHeartBeat() {
@@ -455,19 +460,12 @@ func (rf *Raft) checkHeartBeat() {
 
 			lastHeartBeat := rf.lastHeartBeat.Load().(time.Time)
 			if time.Since(lastHeartBeat) >= electionTimeout {
-				for {
-					if rf.killed() {
-						return
-					}
-					electionTimeout = generateElectionTimeout()
-
-					rf.campaign()
-
-					role, _, _ := rf.getRoleTermVote()
-					if role != CANDIDATE {
-						break
-					}
+				if rf.killed() {
+					return
 				}
+				electionTimeout = generateElectionTimeout()
+
+				rf.campaign()
 			}
 		}
 	}
