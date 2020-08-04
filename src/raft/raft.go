@@ -80,15 +80,26 @@ type Raft struct {
 	matchIndex []int
 
 	// others
-	lastHeartBeat atomic.Value
-	roleMtx       sync.RWMutex // guards role, currentTerm, votedFor
-	role          int
-	logMtx        sync.RWMutex // guards log
-	applyCh       chan ApplyMsg
-	tryApply      chan int
+	lastHeartBeat   atomic.Value
+	electionTimeout time.Duration
+	roleMtx         sync.RWMutex // guards role, currentTerm, votedFor
+	role            int
+	logMtx          sync.RWMutex // guards log
+	applyCh         chan ApplyMsg
+	applyNotifier   chan struct{}
+	leaderNotifier  chan struct{}
 
 	// utilities
 	r *rand.Rand
+}
+
+func (rf *Raft) generateElectionTimeout() {
+	rf.electionTimeout = time.Duration(800+rf.r.Int()%200) * time.Millisecond
+}
+
+func (rf *Raft) shouldAttendElection() bool {
+	lastHeartBeat := rf.lastHeartBeat.Load().(time.Time)
+	return time.Since(lastHeartBeat) >= rf.electionTimeout
 }
 
 func (rf *Raft) updateCommitIndex(value int32) {
@@ -101,12 +112,12 @@ func (rf *Raft) updateCommitIndex(value int32) {
 			break
 		}
 	}
-	rf.tryApply <- 0
+	rf.applyNotifier <- struct{}{}
 }
 
 func (rf *Raft) applyLoop() {
 	for {
-		<-rf.tryApply
+		<-rf.applyNotifier
 		if rf.killed() {
 			return
 		}
@@ -322,7 +333,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	defer rf.roleMtx.RUnlock()
 
 	if rf.role != LEADER {
-		return -1, rf.currentTerm, false
+		return 0, rf.currentTerm, false
 	}
 
 	rf.logMtx.Lock()
@@ -352,7 +363,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
-	rf.tryApply <- 0
+	rf.applyNotifier <- struct{}{}
 }
 
 func (rf *Raft) killed() bool {
@@ -421,16 +432,20 @@ func (rf *Raft) campaign() {
 			}
 
 			if reply.VoteGranted {
-				if atomic.AddInt32(&numVotes, 1) >= int32(rf.majority()) {
+				if atomic.AddInt32(&numVotes, 1) == int32(rf.majority()) {
 					rf.roleMtx.Lock()
 					if rf.role == FOLLOWER && campaignTerm < rf.currentTerm {
 						// do nothing, simply give up
+						rf.roleMtx.Unlock()
 					} else if rf.currentTerm == campaignTerm {
 						rf.becomeLeader()
+						rf.roleMtx.Unlock()
+						rf.sendHeartBeat()
+						rf.leaderNotifier <- struct{}{}
 					} else {
 						log.Fatalf("[term #%v] [%v] invalid case when winning the campaign: campaignTerm = %v", rf.currentTerm, rf.me, campaignTerm)
+						rf.roleMtx.Unlock()
 					}
-					rf.roleMtx.Unlock()
 				}
 			} else if reply.Term > campaignTerm {
 				rf.roleMtx.Lock()
@@ -491,39 +506,45 @@ func (rf *Raft) sendHeartBeat() {
 			}
 
 			rf.roleMtx.Lock()
-			defer rf.roleMtx.Unlock()
 			if reply.Term > rf.currentTerm {
 				rf.becomeFollower(reply.Term)
+			} else if rf.role == LEADER && rf.currentTerm == args.Term {
+				if reply.Success {
+					rf.matchIndex[target] = sendLogTo - 1
+					rf.nextIndex[target] = sendLogTo
+
+					tmp := make([]int, len(rf.peers))
+					copy(tmp, rf.matchIndex)
+					sort.Ints(tmp)
+					newCommitIndex := tmp[len(tmp)-rf.majority()]
+					if rf.log[newCommitIndex].Term == rf.currentTerm {
+						rf.updateCommitIndex(int32(newCommitIndex))
+					}
+				} else {
+					rf.nextIndex[target] = maxInt(rf.nextIndex[target]-1, 1)
+				}
 			}
-			if rf.role != LEADER || rf.currentTerm != args.Term {
-				return
+			rf.roleMtx.Unlock()
+
+			var actionStr string
+			var successStr string
+			if sendLogFrom == sendLogTo {
+				actionStr = "heart beat"
+			} else {
+				actionStr = "send log"
 			}
 			if reply.Success {
-				rf.matchIndex[target] = sendLogTo - 1
-				rf.nextIndex[target] = sendLogTo
-
-				tmp := make([]int, len(rf.peers))
-				copy(tmp, rf.matchIndex)
-				sort.Ints(tmp)
-				newCommitIndex := tmp[len(tmp)-rf.majority()]
-				if rf.log[newCommitIndex].Term == rf.currentTerm {
-					rf.updateCommitIndex(int32(newCommitIndex))
-				}
+				successStr = "success"
 			} else {
-				rf.nextIndex[target] = maxInt(rf.nextIndex[target]-1, 1)
+				successStr = "fail"
 			}
-
-			log.Printf("[term #%v] send log [%v] -> [%v], range [%v, %v), success = %v", rf.currentTerm, rf.me, target, sendLogFrom, sendLogTo, reply.Success)
+			log.Printf("[term #%v] %v [%v] -> [%v], range [%v, %v), %v", args.Term, actionStr, rf.me, target, sendLogFrom, sendLogTo, successStr)
 		}(i)
 	}
 }
 
 func (rf *Raft) eventLoop() {
-	generateElectionTimeout := func() time.Duration {
-		return time.Duration(300+rf.r.Float32()*300) * time.Millisecond
-	}
-
-	electionTimeout := generateElectionTimeout()
+	rf.generateElectionTimeout()
 
 	for {
 		if rf.killed() {
@@ -531,20 +552,20 @@ func (rf *Raft) eventLoop() {
 		}
 		_, isLeader := rf.GetState()
 		if isLeader {
-			time.Sleep(30 * time.Millisecond)
-
+			time.Sleep(100 * time.Millisecond)
 			rf.sendHeartBeat()
 		} else {
-			time.Sleep(electionTimeout)
-
-			lastHeartBeat := rf.lastHeartBeat.Load().(time.Time)
-			if time.Since(lastHeartBeat) >= electionTimeout {
-				if rf.killed() {
-					return
+			select {
+			case <-time.After(rf.electionTimeout):
+				if rf.shouldAttendElection() {
+					if rf.killed() {
+						return
+					}
+					rf.generateElectionTimeout()
+					rf.campaign()
 				}
-				electionTimeout = generateElectionTimeout()
-
-				rf.campaign()
+			case <-rf.leaderNotifier:
+				// do nothing, just wake up
 			}
 		}
 	}
@@ -561,8 +582,13 @@ func (rf *Raft) eventLoop() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
+var timeSeed int
+var once sync.Once
+
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	log.SetFlags((log.LstdFlags | log.Lmicroseconds) &^ log.Ldate)
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -586,9 +612,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastHeartBeat.Store(time.Time{})
 	rf.role = FOLLOWER
 	rf.applyCh = applyCh
-	rf.tryApply = make(chan int, 10)
+	rf.applyNotifier = make(chan struct{}, 10)
+	rf.leaderNotifier = make(chan struct{})
 
-	rf.r = rand.New(rand.NewSource(int64(rf.me * int(time.Now().Unix()))))
+	once.Do(func() {
+		timeSeed = int(time.Now().Unix())
+		log.Printf("time seed = %v", timeSeed)
+	})
+
+	rf.r = rand.New(rand.NewSource(int64(rf.me * timeSeed)))
 
 	go rf.eventLoop()
 	go rf.applyLoop()
