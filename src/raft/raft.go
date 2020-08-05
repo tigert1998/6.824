@@ -82,7 +82,7 @@ type Raft struct {
 	// others
 	lastHeartBeat   atomic.Value
 	electionTimeout time.Duration
-	roleMtx         sync.RWMutex // guards role, currentTerm, votedFor
+	roleMtx         sync.RWMutex // guards role, currentTerm, votedFor, nextIndex, matchIndex
 	role            int
 	logMtx          sync.RWMutex // guards log
 	applyCh         chan ApplyMsg
@@ -311,8 +311,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if reply.Success {
 			rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 			rf.logMtx.Unlock()
-			// todo
-			rf.updateCommitIndex(int32(minInt(len(rf.log), args.LeaderCommit)))
+			rf.updateCommitIndex(int32(minInt(len(rf.log)-1, args.LeaderCommit)))
 		} else {
 			rf.log = rf.log[:minInt(args.PrevLogIndex, len(rf.log))]
 			rf.logMtx.Unlock()
@@ -493,8 +492,7 @@ func (rf *Raft) sendHeartBeat() {
 				return
 			}
 			rf.logMtx.RLock()
-			// todo
-			const MaxEntries = 5
+			const MaxEntries = 10
 			prevLogIndex, prevLogTerm := rf.getLogIndexTerm(rf.nextIndex[target]-1, false)
 			sendLogFrom := rf.nextIndex[target]
 			sendLogTo := minInt(rf.nextIndex[target]+MaxEntries, len(rf.log))
@@ -507,8 +505,7 @@ func (rf *Raft) sendHeartBeat() {
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  prevLogTerm,
 				Entries:      entries,
-				// todo
-				LeaderCommit: int(rf.commitIndex),
+				LeaderCommit: int(atomic.LoadInt32(&rf.commitIndex)),
 			}
 			rf.logMtx.RUnlock()
 			rf.roleMtx.RUnlock()
