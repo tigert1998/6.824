@@ -340,8 +340,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	rf.roleMtx.RLock()
-	defer rf.roleMtx.RUnlock()
+	rf.roleMtx.Lock()
+	defer rf.roleMtx.Unlock()
 
 	if rf.role != LEADER {
 		return 0, rf.currentTerm, false
@@ -527,9 +527,11 @@ func (rf *Raft) sendHeartBeat() {
 					copy(tmp, rf.matchIndex)
 					sort.Ints(tmp)
 					newCommitIndex := tmp[len(tmp)-rf.majority()]
+					rf.logMtx.RLock()
 					if rf.log[newCommitIndex].Term == rf.currentTerm {
 						rf.updateCommitIndex(int32(newCommitIndex))
 					}
+					rf.logMtx.RUnlock()
 				} else {
 					rf.nextIndex[target] = maxInt(rf.nextIndex[target]-1, 1)
 				}
