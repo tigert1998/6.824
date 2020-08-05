@@ -147,6 +147,7 @@ func (rf *Raft) becomeLeader() {
 		rf.nextIndex[i] = logLen
 		rf.matchIndex[i] = 0
 	}
+	rf.matchIndex[rf.me] = logLen - 1
 }
 
 func (rf *Raft) becomeFollower(term int) {
@@ -261,8 +262,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-	} else if args.Term == rf.currentTerm {
-		rf.lastHeartBeat.Store(time.Now())
+		return
+	}
+
+	// whose log is more up-to-date
+	lastLogIndex, lastLogTerm := rf.getLogIndexTerm(0, true)
+	if args.LastLogTerm < lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	rf.lastHeartBeat.Store(time.Now())
+
+	if args.Term == rf.currentTerm {
 		reply.Term = rf.currentTerm
 		if rf.votedFor == -1 && rf.role == FOLLOWER {
 			rf.votedFor = args.CandidateID
@@ -271,7 +284,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = false
 		}
 	} else {
-		rf.lastHeartBeat.Store(time.Now())
 		rf.currentTerm = args.Term
 		rf.role = FOLLOWER
 		rf.votedFor = args.CandidateID
@@ -297,7 +309,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logMtx.Lock()
 		reply.Success = rf.logMatch(args.PrevLogIndex, args.PrevLogTerm)
 		if reply.Success {
-			rf.log = append(rf.log, args.Entries...)
+			rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 			rf.logMtx.Unlock()
 			// todo
 			rf.updateCommitIndex(int32(minInt(len(rf.log), args.LeaderCommit)))
@@ -344,6 +356,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 		Command: command,
 	})
+	rf.matchIndex[rf.me] = index
 
 	log.Printf("[term #%v] issue command [%v], index = %v", rf.currentTerm, rf.me, index)
 
