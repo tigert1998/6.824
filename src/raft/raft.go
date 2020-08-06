@@ -297,10 +297,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.lastHeartBeat.Store(time.Now())
-
 	rf.roleMtx.Lock()
 	defer rf.roleMtx.Unlock()
+
+	rf.lastHeartBeat.Store(time.Now())
 
 	if args.Term < rf.currentTerm {
 		// obsolete package
@@ -385,20 +385,21 @@ func (rf *Raft) killed() bool {
 
 func (rf *Raft) campaign() {
 	// attend election
-	var campaignTerm int
-	{
-		rf.roleMtx.Lock()
-		if rf.role == LEADER {
-			rf.roleMtx.Unlock()
-			return
-		}
-		rf.votedFor = rf.me
-		rf.currentTerm++
-		rf.role = CANDIDATE
-		campaignTerm = rf.currentTerm
+	rf.roleMtx.Lock()
+	defer rf.roleMtx.Unlock()
 
-		rf.roleMtx.Unlock()
+	if rf.role == LEADER {
+		return
 	}
+	if !rf.shouldAttendElection() {
+		return
+	}
+
+	rf.votedFor = rf.me
+	rf.currentTerm++
+	rf.role = CANDIDATE
+	campaignTerm := rf.currentTerm
+
 	log.Printf("[term #%v] [%v] starts election", campaignTerm, rf.me)
 
 	lastLogIndex, lastLogTerm := rf.getLogIndexTerm(0, true)
@@ -413,10 +414,6 @@ func (rf *Raft) campaign() {
 	var numVotes int32 = 1
 	for i := 0; i < len(rf.peers); i++ {
 		if rf.killed() {
-			return
-		}
-		role, term, _ := rf.getRoleTermVote()
-		if role != CANDIDATE || campaignTerm < term {
 			return
 		}
 		if i == rf.me {
@@ -499,6 +496,7 @@ func (rf *Raft) sendHeartBeat() {
 
 			entries := make([]LogEntry, sendLogTo-sendLogFrom)
 			copy(entries, rf.log[sendLogFrom:sendLogTo])
+			rf.logMtx.RUnlock()
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderID:     rf.me,
@@ -507,7 +505,6 @@ func (rf *Raft) sendHeartBeat() {
 				Entries:      entries,
 				LeaderCommit: int(atomic.LoadInt32(&rf.commitIndex)),
 			}
-			rf.logMtx.RUnlock()
 			rf.roleMtx.RUnlock()
 
 			reply := AppendEntriesReply{}
