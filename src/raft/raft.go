@@ -164,6 +164,24 @@ func (rf *Raft) logMatch(index int, term int) bool {
 	}
 }
 
+func (rf *Raft) nextPossibleLogMatch(index int, term int) int {
+	l := 0
+	r := minInt(len(rf.log)-1, index)
+	for l < r {
+		mid := (l + r + 1) / 2
+		if rf.log[mid].Term <= term {
+			l = mid
+		} else {
+			r = mid - 1
+		}
+	}
+	ans := l
+	if ans == index && rf.log[index].Term < term {
+		ans--
+	}
+	return ans
+}
+
 func (rf *Raft) majority() int {
 	return len(rf.peers)/2 + 1
 }
@@ -253,8 +271,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term           int
+	Success        bool
+	RejectLogIndex int
+	RejectLogTerm  int
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -331,6 +351,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.updateCommitIndex(int32(minInt(len(rf.log)-1, args.LeaderCommit)))
 		} else {
 			rf.log = rf.log[:minInt(args.PrevLogIndex, len(rf.log))]
+			reply.RejectLogIndex = rf.nextPossibleLogMatch(args.PrevLogIndex, args.PrevLogTerm)
+			reply.RejectLogTerm = rf.log[reply.RejectLogIndex].Term
 		}
 		rf.persist()
 		rf.logMtx.Unlock()
@@ -462,18 +484,16 @@ func (rf *Raft) campaign() {
 			if reply.VoteGranted {
 				if atomic.AddInt32(&numVotes, 1) == int32(rf.majority()) {
 					rf.roleMtx.Lock()
-					if rf.role == FOLLOWER && campaignTerm < rf.currentTerm {
+					if rf.role == FOLLOWER || campaignTerm < rf.currentTerm {
 						// do nothing, simply give up
 						rf.roleMtx.Unlock()
-					} else if rf.currentTerm == campaignTerm {
+					} else {
 						rf.becomeLeader()
 						rf.persist()
 						rf.roleMtx.Unlock()
 
 						rf.sendHeartBeat()
 						rf.leaderNotifier <- struct{}{}
-					} else {
-						log.Fatalf("[term #%v] [%v] invalid case when winning the campaign: campaignTerm = %v", rf.currentTerm, rf.me, campaignTerm)
 					}
 				}
 			} else if reply.Term > campaignTerm {
@@ -510,7 +530,7 @@ func (rf *Raft) sendHeartBeat() {
 				return
 			}
 			rf.logMtx.RLock()
-			const MaxEntries = 10
+			const MaxEntries = 100
 			prevLogIndex, prevLogTerm := rf.getLogIndexTerm(rf.nextIndex[target]-1, false)
 			sendLogFrom := rf.nextIndex[target]
 			sendLogTo := minInt(rf.nextIndex[target]+MaxEntries, len(rf.log))
@@ -529,47 +549,59 @@ func (rf *Raft) sendHeartBeat() {
 			rf.roleMtx.RUnlock()
 
 			reply := AppendEntriesReply{}
-			if !rf.peers[target].Call("Raft.AppendEntries", &args, &reply) {
-				return
-			}
+			ret := rf.peers[target].Call("Raft.AppendEntries", &args, &reply)
 
-			rf.roleMtx.Lock()
-			if reply.Term > rf.currentTerm {
-				rf.becomeFollower(reply.Term)
-			} else if rf.role == LEADER && rf.currentTerm == args.Term {
-				if reply.Success {
-					rf.matchIndex[target] = sendLogTo - 1
-					rf.nextIndex[target] = sendLogTo
+			if ret {
+				rf.roleMtx.Lock()
+				if reply.Term < rf.currentTerm {
+					// do nothing
+				} else if reply.Term > rf.currentTerm {
+					rf.becomeFollower(reply.Term)
+					rf.persist()
+				} else if rf.role == LEADER && rf.currentTerm == args.Term {
+					if reply.Success {
+						rf.matchIndex[target] = sendLogTo - 1
+						rf.nextIndex[target] = sendLogTo
 
-					tmp := make([]int, len(rf.peers))
-					copy(tmp, rf.matchIndex)
-					sort.Ints(tmp)
-					newCommitIndex := tmp[len(tmp)-rf.majority()]
-					rf.logMtx.RLock()
-					if rf.log[newCommitIndex].Term == rf.currentTerm {
-						rf.updateCommitIndex(int32(newCommitIndex))
+						tmp := make([]int, len(rf.peers))
+						copy(tmp, rf.matchIndex)
+						sort.Ints(tmp)
+						newCommitIndex := tmp[len(tmp)-rf.majority()]
+						rf.logMtx.RLock()
+						if rf.log[newCommitIndex].Term == rf.currentTerm {
+							rf.updateCommitIndex(int32(newCommitIndex))
+						}
+						rf.logMtx.RUnlock()
+					} else {
+						rf.logMtx.RLock()
+						nextIndex := rf.nextPossibleLogMatch(reply.RejectLogIndex, reply.RejectLogTerm)
+						rf.logMtx.RUnlock()
+						if nextIndex < rf.nextIndex[target] {
+							rf.nextIndex[target] = maxInt(nextIndex, rf.matchIndex[target]+1)
+						}
 					}
-					rf.logMtx.RUnlock()
-				} else {
-					rf.nextIndex[target] = maxInt(rf.nextIndex[target]-1, 1)
+					rf.persist()
 				}
+				rf.roleMtx.Unlock()
 			}
-			rf.persist()
-			rf.roleMtx.Unlock()
 
 			var actionStr string
-			var successStr string
+			var resultStr string
 			if sendLogFrom == sendLogTo {
 				actionStr = "heart beat"
 			} else {
 				actionStr = "send log"
 			}
-			if reply.Success {
-				successStr = "success"
+			if ret {
+				if reply.Success {
+					resultStr = "success"
+				} else {
+					resultStr = "fail"
+				}
 			} else {
-				successStr = "fail"
+				resultStr = "lost"
 			}
-			log.Printf("[term #%v] %v [%v] -> [%v], range [%v, %v), %v", args.Term, actionStr, rf.me, target, sendLogFrom, sendLogTo, successStr)
+			log.Printf("[term #%v] %v [%v] -> [%v], range [%v, %v), %v", args.Term, actionStr, rf.me, target, sendLogFrom, sendLogTo, resultStr)
 		}(i)
 	}
 }
@@ -618,7 +650,13 @@ var once sync.Once
 
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	log.SetFlags((log.LstdFlags | log.Lmicroseconds) &^ log.Ldate)
+	once.Do(func() {
+		log.SetFlags((log.LstdFlags | log.Lmicroseconds) &^ log.Ldate)
+		timeSeed = int(time.Now().Unix())
+		log.Printf("time seed = %v", timeSeed)
+	})
+
+	log.Printf("[%v] reboots!", me)
 
 	rf := &Raft{}
 	rf.peers = peers
@@ -647,11 +685,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.applyNotifier = make(chan struct{}, 10)
 	rf.leaderNotifier = make(chan struct{})
-
-	once.Do(func() {
-		timeSeed = int(time.Now().Unix())
-		log.Printf("time seed = %v", timeSeed)
-	})
 
 	rf.r = rand.New(rand.NewSource(int64(rf.me * timeSeed)))
 
