@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"bytes"
 	"log"
 	"math/rand"
 	"sort"
@@ -25,11 +26,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"../labgob"
 	"../labrpc"
 )
-
-// import "bytes"
-// import "../labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -191,42 +190,45 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, role == LEADER
 }
 
-//
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-//
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
-//
-// restore previously persisted state.
-//
-func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
+func (rf *Raft) readPersist(data []byte) error {
+	if data == nil || len(data) < 1 {
+		// bootstrap without any state
+		return nil
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+
+	e := d.Decode(&currentTerm)
+	if e != nil {
+		return e
+	}
+	e = d.Decode(&votedFor)
+	if e != nil {
+		return e
+	}
+	e = d.Decode(&log)
+	if e != nil {
+		return e
+	}
+
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.log = log
+	return nil
 }
 
 type RequestVoteArgs struct {
@@ -309,7 +311,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.logMtx.Lock()
 		reply.Success = rf.logMatch(args.PrevLogIndex, args.PrevLogTerm)
 		if reply.Success {
-			rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+			var i int
+			for i = 0; i < len(args.Entries) && args.PrevLogIndex+1+i < len(rf.log); i++ {
+				if args.Entries[i].Term != rf.log[args.PrevLogIndex+1+i].Term {
+					break
+				}
+			}
+			rf.log = append(rf.log[:args.PrevLogIndex+1+i], args.Entries[i:]...)
 			rf.logMtx.Unlock()
 			rf.updateCommitIndex(int32(minInt(len(rf.log)-1, args.LeaderCommit)))
 		} else {
@@ -615,8 +623,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 
 	// initialize from state persisted before a crash
-	// todo
-	rf.readPersist(persister.ReadRaftState())
+	e := rf.readPersist(persister.ReadRaftState())
+	if e != nil {
+		log.Fatalf("%v", e)
+	}
 
 	rf.lastHeartBeat.Store(time.Time{})
 	rf.role = FOLLOWER
