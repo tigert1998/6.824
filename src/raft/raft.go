@@ -282,6 +282,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if rf.votedFor == -1 && rf.role == FOLLOWER {
 			rf.votedFor = args.CandidateID
 			reply.VoteGranted = true
+
+			rf.persist()
 		} else {
 			reply.VoteGranted = false
 		}
@@ -291,6 +293,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateID
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
+
+		rf.persist()
 	}
 
 	if reply.VoteGranted {
@@ -306,8 +310,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.Term < rf.currentTerm {
 		// obsolete package
+		reply.Term = rf.currentTerm
 		reply.Success = false
 	} else {
+		if args.Term > rf.currentTerm {
+			rf.becomeFollower(args.Term)
+		}
+		reply.Term = rf.currentTerm
+
 		rf.logMtx.Lock()
 		reply.Success = rf.logMatch(args.PrevLogIndex, args.PrevLogTerm)
 		if reply.Success {
@@ -318,19 +328,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				}
 			}
 			rf.log = append(rf.log[:args.PrevLogIndex+1+i], args.Entries[i:]...)
-			rf.logMtx.Unlock()
 			rf.updateCommitIndex(int32(minInt(len(rf.log)-1, args.LeaderCommit)))
 		} else {
 			rf.log = rf.log[:minInt(args.PrevLogIndex, len(rf.log))]
-			rf.logMtx.Unlock()
 		}
-
-		if args.Term > rf.currentTerm {
-			rf.becomeFollower(args.Term)
-		}
+		rf.persist()
+		rf.logMtx.Unlock()
 	}
-
-	reply.Term = rf.currentTerm
 }
 
 //
@@ -365,9 +369,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	})
 	rf.matchIndex[rf.me] = index
 
-	log.Printf("[term #%v] issue command [%v], index = %v", rf.currentTerm, rf.me, index)
+	rf.persist()
 
-	return index, rf.currentTerm, true
+	log.Printf("[term #%v] issue command [%v], index = %v", rf.currentTerm, rf.me, index)
+	currentTerm := rf.currentTerm
+
+	// rf.sendHeartBeat()
+
+	return index, currentTerm, true
 }
 
 //
@@ -408,8 +417,6 @@ func (rf *Raft) campaign() {
 	rf.role = CANDIDATE
 	campaignTerm := rf.currentTerm
 
-	log.Printf("[term #%v] [%v] starts election", campaignTerm, rf.me)
-
 	lastLogIndex, lastLogTerm := rf.getLogIndexTerm(0, true)
 
 	args := RequestVoteArgs{
@@ -418,6 +425,10 @@ func (rf *Raft) campaign() {
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
+
+	rf.persist()
+
+	log.Printf("[term #%v] [%v] starts election", campaignTerm, rf.me)
 
 	var numVotes int32 = 1
 	for i := 0; i < len(rf.peers); i++ {
@@ -456,18 +467,20 @@ func (rf *Raft) campaign() {
 						rf.roleMtx.Unlock()
 					} else if rf.currentTerm == campaignTerm {
 						rf.becomeLeader()
+						rf.persist()
 						rf.roleMtx.Unlock()
+
 						rf.sendHeartBeat()
 						rf.leaderNotifier <- struct{}{}
 					} else {
 						log.Fatalf("[term #%v] [%v] invalid case when winning the campaign: campaignTerm = %v", rf.currentTerm, rf.me, campaignTerm)
-						rf.roleMtx.Unlock()
 					}
 				}
 			} else if reply.Term > campaignTerm {
 				rf.roleMtx.Lock()
 				if reply.Term > rf.currentTerm {
 					rf.becomeFollower(reply.Term)
+					rf.persist()
 				}
 				rf.roleMtx.Unlock()
 			}
@@ -541,6 +554,7 @@ func (rf *Raft) sendHeartBeat() {
 					rf.nextIndex[target] = maxInt(rf.nextIndex[target]-1, 1)
 				}
 			}
+			rf.persist()
 			rf.roleMtx.Unlock()
 
 			var actionStr string
