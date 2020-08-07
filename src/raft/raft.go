@@ -347,7 +347,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					break
 				}
 			}
-			rf.log = append(rf.log[:args.PrevLogIndex+1+i], args.Entries[i:]...)
+			if i < len(args.Entries) {
+				rf.log = append(rf.log[:args.PrevLogIndex+1+i], args.Entries[i:]...)
+			}
 			rf.updateCommitIndex(int32(minInt(len(rf.log)-1, args.LeaderCommit)))
 		} else {
 			rf.log = rf.log[:minInt(args.PrevLogIndex, len(rf.log))]
@@ -560,8 +562,8 @@ func (rf *Raft) sendHeartBeat() {
 					rf.persist()
 				} else if rf.role == LEADER && rf.currentTerm == args.Term {
 					if reply.Success {
-						rf.matchIndex[target] = sendLogTo - 1
-						rf.nextIndex[target] = sendLogTo
+						rf.matchIndex[target] = maxInt(rf.matchIndex[target], sendLogTo-1)
+						rf.nextIndex[target] = rf.matchIndex[target] + 1
 
 						tmp := make([]int, len(rf.peers))
 						copy(tmp, rf.matchIndex)
