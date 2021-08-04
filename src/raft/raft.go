@@ -338,8 +338,8 @@ func (rf *Raft) trimLog(lastIncludedTerm int, lastIncludedIndex int) {
 // have more recent info since it communicate the snapshot on applyCh.
 //
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-	rf.roleMtx.RLock()
-	defer rf.roleMtx.RUnlock()
+	rf.roleMtx.Lock()
+	defer rf.roleMtx.Unlock()
 	rf.logMtx.Lock()
 	defer rf.logMtx.Unlock()
 	if lastIncludedIndex <= rf.lastIncludedIndex {
@@ -358,8 +358,8 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	rf.roleMtx.RLock()
-	defer rf.roleMtx.RUnlock()
+	rf.roleMtx.Lock()
+	defer rf.roleMtx.Unlock()
 	rf.logMtx.Lock()
 	defer rf.logMtx.Unlock()
 	log.Printf("[term #%d] snapshot [%d], last included %v", rf.currentTerm, rf.me, index)
