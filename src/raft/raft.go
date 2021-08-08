@@ -47,6 +47,13 @@ const (
 	FOLLOWER  = 2
 )
 
+const (
+	HEARTBEAT_WITH_LOG = 20
+	HEARTBEAT          = 100
+	ELECTION_BASE      = 800
+	ELECTION_RAND      = 200
+)
+
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -96,6 +103,9 @@ type Raft struct {
 	applyNotifier   chan struct{}
 	leaderNotifier  chan struct{}
 
+	// for leaders
+	lastHeartBeats []atomic.Value
+
 	// utilities
 	r *rand.Rand
 }
@@ -123,7 +133,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 }
 
 func (rf *Raft) generateElectionTimeout() {
-	rf.electionTimeout = time.Duration(800+rf.r.Int()%200) * time.Millisecond
+	rf.electionTimeout = time.Duration(ELECTION_BASE+rf.r.Int()%ELECTION_RAND) * time.Millisecond
 }
 
 func (rf *Raft) shouldAttendElection() bool {
@@ -196,6 +206,10 @@ func (rf *Raft) becomeLeader() {
 		rf.matchIndex[i] = 0
 	}
 	rf.matchIndex[rf.me] = logLen - 1
+
+	for i := 0; i < len(rf.lastHeartBeats); i++ {
+		rf.lastHeartBeats[i].Store(time.Time{})
+	}
 }
 
 func (rf *Raft) becomeFollower(term int) {
@@ -732,6 +746,15 @@ func (rf *Raft) sendHeartBeat() {
 				sendLogFrom := rf.nextIndex[target]
 				sendLogTo := minInt(rf.nextIndex[target]+MaxEntries, rf.logLen())
 
+				if sendLogFrom == sendLogTo {
+					if time.Since(rf.lastHeartBeats[target].Load().(time.Time)) < HEARTBEAT*time.Millisecond {
+						rf.roleMtx.RUnlock()
+						rf.logMtx.RUnlock()
+						return
+					}
+				}
+				rf.lastHeartBeats[target].Store(time.Now())
+
 				entries := make([]LogEntry, sendLogTo-sendLogFrom)
 				copy(entries, rf.getLogs(sendLogFrom, sendLogTo))
 				rf.logMtx.RUnlock()
@@ -803,7 +826,7 @@ func (rf *Raft) eventLoop() {
 		}
 		_, isLeader := rf.GetState()
 		if isLeader {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(HEARTBEAT_WITH_LOG * time.Millisecond)
 			rf.sendHeartBeat()
 		} else {
 			select {
@@ -875,6 +898,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.applyNotifier = make(chan struct{}, 10)
 	rf.leaderNotifier = make(chan struct{})
+
+	rf.lastHeartBeats = make([]atomic.Value, len(rf.peers))
 
 	rf.r = rand.New(rand.NewSource(int64(rf.me * timeSeed)))
 
