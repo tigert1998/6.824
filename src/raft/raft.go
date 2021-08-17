@@ -49,7 +49,7 @@ const (
 
 const (
 	HEARTBEAT_WITH_LOG = 20
-	HEARTBEAT          = 100
+	HEARTBEAT          = 200
 	ELECTION_BASE      = 800
 	ELECTION_RAND      = 200
 )
@@ -175,9 +175,13 @@ func (rf *Raft) applyLoop() {
 		}
 		commitIndex := atomic.LoadInt32(&rf.commitIndex)
 		for {
-			rf.logMtx.RLock()
 			i := atomic.LoadInt32(&rf.lastApplied) + 1
-			if i <= commitIndex && atomic.CompareAndSwapInt32(&rf.lastApplied, i-1, i) {
+			if i > commitIndex {
+				break
+			}
+
+			rf.logMtx.RLock()
+			if atomic.CompareAndSwapInt32(&rf.lastApplied, i-1, i) {
 				msg := ApplyMsg{
 					CommandValid:  true,
 					Command:       rf.getLog(int(i)).Command,
