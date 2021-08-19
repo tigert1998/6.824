@@ -91,12 +91,14 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	reply.Err = OK
 
 	var value string
+	kv.mu.Lock()
 	value, ok = kv.dic[args.Key]
 	if ok {
 		reply.Value = value
 	} else {
 		reply.Value = ""
 	}
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -123,6 +125,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	_ = <-ch
 
 	reply.Err = OK
+	kv.mu.Lock()
 	if op == PUT {
 		kv.dic[args.Key] = args.Value
 	} else {
@@ -134,6 +137,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		buffer.WriteString(args.Value)
 		kv.dic[args.Key] = buffer.String()
 	}
+	kv.mu.Unlock()
 }
 
 //

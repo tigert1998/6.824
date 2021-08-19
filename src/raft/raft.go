@@ -900,7 +900,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastHeartBeat.Store(time.Time{})
 	rf.role = FOLLOWER
 	rf.applyCh = applyCh
-	rf.applyNotifier = make(chan struct{}, 10)
+	rf.applyNotifier = make(chan struct{}, 100000)
 	rf.leaderNotifier = make(chan struct{})
 
 	rf.lastHeartBeats = make([]atomic.Value, len(rf.peers))
