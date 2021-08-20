@@ -32,10 +32,12 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Op    int
-	Key   string
-	Value string
-	ID    string
+	Op       int
+	Key      string
+	Value    string
+	ID       string
+	ClientID string
+	TS       int64
 }
 
 type KVServer struct {
@@ -48,8 +50,9 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	dic       map[string]string
-	lockTable map[string]chan struct{}
+	dic         map[string]string
+	lockTable   map[string]chan struct{}
+	clientTable map[string]int64
 }
 
 func (kv *KVServer) applyLoop() {
@@ -110,8 +113,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	kv.mu.Lock()
+	ts, ok := kv.clientTable[args.ClientID]
+	if ok && ts >= args.TS {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+
 	id := uuid.New().String()
-	_, _, ok := kv.rf.Start(Op{Op: op, Key: args.Key, Value: args.Value, ID: id})
+	_, _, ok = kv.rf.Start(Op{Op: op, Key: args.Key, Value: args.Value, ID: id, ClientID: args.ClientID, TS: args.TS})
 	if !ok {
 		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
@@ -126,6 +136,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	reply.Err = OK
 	kv.mu.Lock()
+	ts, ok = kv.clientTable[args.ClientID]
+	if ok && ts >= args.TS {
+		kv.mu.Unlock()
+		return
+	}
+	kv.clientTable[args.ClientID] = args.TS
 	if op == PUT {
 		kv.dic[args.Key] = args.Value
 	} else {
@@ -193,6 +209,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.dic = map[string]string{}
 	kv.lockTable = map[string]chan struct{}{}
+	kv.clientTable = map[string]int64{}
 
 	go kv.applyLoop()
 

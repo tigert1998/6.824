@@ -7,11 +7,13 @@ import (
 	"time"
 
 	"6.824/labrpc"
+	"github.com/google/uuid"
 )
 
 type Clerk struct {
 	servers  []*labrpc.ClientEnd
 	leaderID int32
+	me       string
 }
 
 func nrand() int64 {
@@ -25,6 +27,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	ck.leaderID = 0
+	ck.me = uuid.New().String()
 	return ck
 }
 
@@ -72,7 +75,7 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{Key: key, Value: value, Op: op}
+	args := PutAppendArgs{Key: key, Value: value, Op: op, ClientID: ck.me, TS: time.Now().UnixNano()}
 	reply := PutAppendReply{}
 
 	for i := atomic.LoadInt32(&ck.leaderID); ; {
