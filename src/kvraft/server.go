@@ -5,6 +5,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
@@ -20,6 +21,8 @@ const (
 	APPEND = iota
 	GET    = iota
 )
+
+const APPLYLOOP_WAKEUP = 500
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -40,6 +43,11 @@ type Op struct {
 	TS       int64
 }
 
+type lockTableItem struct {
+	ch chan bool
+	id string
+}
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -51,25 +59,77 @@ type KVServer struct {
 
 	// Your definitions here.
 	dic         map[string]string
-	lockTable   map[string]chan struct{}
+	lockTable   map[int]lockTableItem
 	clientTable map[string]int64
 }
 
+func (kv *KVServer) applyCommand(op Op) {
+	if op.Op == GET {
+		return
+	}
+	ts, ok := kv.clientTable[op.ClientID]
+	if ok && ts >= op.TS {
+		return
+	}
+	kv.clientTable[op.ClientID] = op.TS
+	if op.Op == PUT {
+		kv.dic[op.Key] = op.Value
+	} else if op.Op == APPEND {
+		var buffer bytes.Buffer
+		value, ok := kv.dic[op.Key]
+		if ok {
+			buffer.WriteString(value)
+		}
+		buffer.WriteString(op.Value)
+		kv.dic[op.Key] = buffer.String()
+	}
+}
+
+func (kv *KVServer) releaseLockTable() {
+	for _, item := range kv.lockTable {
+		item.ch <- false
+	}
+	kv.lockTable = map[int]lockTableItem{}
+}
+
 func (kv *KVServer) applyLoop() {
+	term, isLeader := kv.rf.GetState()
 	for {
 		if kv.killed() {
 			return
 		}
 
-		msg := <-kv.applyCh
+		var msg raft.ApplyMsg
+
+		select {
+		case <-time.After(APPLYLOOP_WAKEUP * time.Millisecond):
+			newTerm, newIsLeader := kv.rf.GetState()
+			if isLeader {
+				if newTerm != term || !newIsLeader {
+					kv.mu.Lock()
+					kv.releaseLockTable()
+					kv.mu.Unlock()
+				}
+			}
+			term = newTerm
+			isLeader = newIsLeader
+			continue
+		case msg = <-kv.applyCh:
+		}
+
 		if msg.CommandValid {
 			op := msg.Command.(Op)
 			kv.mu.Lock()
-			ch, ok := kv.lockTable[op.ID]
+			kv.applyCommand(op)
+			item, ok := kv.lockTable[msg.CommandIndex]
 			if ok {
-				ch <- struct{}{}
+				if item.id == op.ID {
+					item.ch <- true
+				} else {
+					kv.releaseLockTable()
+				}
 			}
-			delete(kv.lockTable, op.ID)
+			delete(kv.lockTable, msg.CommandIndex)
 			kv.mu.Unlock()
 		}
 	}
@@ -78,7 +138,7 @@ func (kv *KVServer) applyLoop() {
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	id := uuid.New().String()
-	_, _, ok := kv.rf.Start(Op{Op: GET, Key: args.Key, Value: "", ID: id})
+	index, _, ok := kv.rf.Start(Op{Op: GET, Key: args.Key, ID: id})
 	if !ok {
 		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
@@ -86,12 +146,16 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	log.Printf("[%v] Get(key: \"%v\")", kv.me, args.Key)
 
-	ch := make(chan struct{})
-	kv.lockTable[id] = ch
+	ch := make(chan bool)
+	kv.lockTable[index] = lockTableItem{ch: ch, id: id}
 	kv.mu.Unlock()
 
-	_ = <-ch
-	reply.Err = OK
+	if <-ch {
+		reply.Err = OK
+	} else {
+		reply.Err = ErrWrongLeader
+		return
+	}
 
 	var value string
 	kv.mu.Lock()
@@ -121,39 +185,29 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	id := uuid.New().String()
-	_, _, ok = kv.rf.Start(Op{Op: op, Key: args.Key, Value: args.Value, ID: id, ClientID: args.ClientID, TS: args.TS})
+	index, _, ok := kv.rf.Start(Op{
+		Op:       op,
+		Key:      args.Key,
+		Value:    args.Value,
+		ID:       id,
+		ClientID: args.ClientID,
+		TS:       args.TS,
+	})
 	if !ok {
 		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
 		return
 	}
 	log.Printf("[%v] %v(key: \"%v\", value: \"%v\")", kv.me, args.Op, args.Key, args.Value)
-	ch := make(chan struct{})
-	kv.lockTable[id] = ch
+	ch := make(chan bool)
+	kv.lockTable[index] = lockTableItem{ch: ch, id: id}
 	kv.mu.Unlock()
 
-	_ = <-ch
-
-	reply.Err = OK
-	kv.mu.Lock()
-	ts, ok = kv.clientTable[args.ClientID]
-	if ok && ts >= args.TS {
-		kv.mu.Unlock()
-		return
-	}
-	kv.clientTable[args.ClientID] = args.TS
-	if op == PUT {
-		kv.dic[args.Key] = args.Value
+	if <-ch {
+		reply.Err = OK
 	} else {
-		var buffer bytes.Buffer
-		value, ok := kv.dic[args.Key]
-		if ok {
-			buffer.WriteString(value)
-		}
-		buffer.WriteString(args.Value)
-		kv.dic[args.Key] = buffer.String()
+		reply.Err = ErrWrongLeader
 	}
-	kv.mu.Unlock()
 }
 
 //
@@ -208,7 +262,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	log.Printf("[%v] kvserver reboots!", me)
 
 	kv.dic = map[string]string{}
-	kv.lockTable = map[string]chan struct{}{}
+	kv.lockTable = map[int]lockTableItem{}
 	kv.clientTable = map[string]int64{}
 
 	go kv.applyLoop()
