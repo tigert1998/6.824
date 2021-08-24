@@ -49,11 +49,12 @@ type lockTableItem struct {
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	mu        sync.Mutex
+	me        int
+	rf        *raft.Raft
+	persister *raft.Persister
+	applyCh   chan raft.ApplyMsg
+	dead      int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
 
@@ -92,7 +93,41 @@ func (kv *KVServer) releaseLockTable() {
 	kv.lockTable = map[int]lockTableItem{}
 }
 
+func (kv *KVServer) getSerializedSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.dic)
+	e.Encode(kv.clientTable)
+	return w.Bytes()
+}
+
+func (kv *KVServer) readPersist(data []byte) error {
+	if data == nil || len(data) < 1 {
+		// bootstrap without any state
+		return nil
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var dic map[string]string
+	var clientTable map[string]int64
+
+	e := d.Decode(&dic)
+	if e != nil {
+		return e
+	}
+	e = d.Decode(&clientTable)
+	if e != nil {
+		return e
+	}
+	kv.dic = dic
+	kv.clientTable = clientTable
+	return nil
+}
+
 func (kv *KVServer) applyLoop() {
+	applyIndex := 0
+
 	term, isLeader := kv.rf.GetState()
 	for {
 		if kv.killed() {
@@ -120,6 +155,7 @@ func (kv *KVServer) applyLoop() {
 		if msg.CommandValid {
 			op := msg.Command.(Op)
 			kv.mu.Lock()
+			applyIndex = msg.CommandIndex
 			kv.applyCommand(op)
 			item, ok := kv.lockTable[msg.CommandIndex]
 			if ok {
@@ -130,6 +166,18 @@ func (kv *KVServer) applyLoop() {
 				}
 			}
 			delete(kv.lockTable, msg.CommandIndex)
+
+			if kv.maxraftstate > 0 && kv.maxraftstate <= kv.persister.RaftStateSize() {
+				kv.rf.Snapshot(msg.CommandIndex, kv.getSerializedSnapshot())
+			}
+			kv.mu.Unlock()
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) && msg.SnapshotIndex > applyIndex {
+				kv.readPersist(msg.Snapshot)
+				applyIndex = msg.SnapshotIndex
+			}
+			kv.releaseLockTable()
 			kv.mu.Unlock()
 		}
 	}
@@ -256,6 +304,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
 
 	kv.dead = 0
 
@@ -264,6 +313,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.dic = map[string]string{}
 	kv.lockTable = map[int]lockTableItem{}
 	kv.clientTable = map[string]int64{}
+
+	e := kv.readPersist(persister.ReadSnapshot())
+	if e != nil {
+		log.Fatalf("%v", e)
+	}
 
 	go kv.applyLoop()
 

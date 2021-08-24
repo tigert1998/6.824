@@ -493,10 +493,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 
 		rf.logMtx.Lock()
-		reply.Success = rf.logMatch(args.PrevLogIndex, args.PrevLogTerm)
+		defer rf.logMtx.Unlock()
+		if args.PrevLogIndex < rf.lastIncludedIndex {
+			if args.PrevLogIndex+len(args.Entries) <= rf.lastIncludedIndex {
+				reply.Success = true
+				return
+			} else {
+				reply.Success = rf.logMatch(rf.lastIncludedIndex, args.Entries[rf.lastIncludedIndex-args.PrevLogIndex-1].Term)
+			}
+		} else {
+			reply.Success = rf.logMatch(args.PrevLogIndex, args.PrevLogTerm)
+		}
 		if reply.Success {
-			var i int
-			for i = 0; i < len(args.Entries) && args.PrevLogIndex+1+i < rf.logLen(); i++ {
+			i := maxInt(0, rf.lastIncludedIndex-args.PrevLogIndex)
+			for ; i < len(args.Entries) && args.PrevLogIndex+1+i < rf.logLen(); i++ {
 				if args.Entries[i].Term != rf.getLog(args.PrevLogIndex+1+i).Term {
 					break
 				}
@@ -512,7 +522,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.RejectLogTerm = rejectLogTerm
 		}
 		rf.persist()
-		rf.logMtx.Unlock()
 	}
 }
 
@@ -672,6 +681,9 @@ func (rf *Raft) calcNewCommitIndex() {
 	copy(tmp, rf.matchIndex)
 	sort.Ints(tmp)
 	newCommitIndex := tmp[len(tmp)-rf.majority()]
+	if newCommitIndex <= int(atomic.LoadInt32(&rf.commitIndex)) {
+		return
+	}
 	rf.logMtx.RLock()
 	_, term := rf.getLogIndexTerm(newCommitIndex, false)
 	if term == rf.currentTerm {
@@ -704,6 +716,12 @@ func (rf *Raft) sendHeartBeat() {
 
 			if rf.nextIndex[target] < rf.lastIncludedIndex+1 {
 				// InstallSnapshot
+				if time.Since(rf.lastHeartBeats[target].Load().(time.Time)) < HEARTBEAT*time.Millisecond {
+					rf.roleMtx.RUnlock()
+					return
+				}
+				rf.lastHeartBeats[target].Store(time.Now())
+
 				args := InstallSnapshotArgs{
 					Term:              rf.currentTerm,
 					LastIncludedIndex: rf.lastIncludedIndex,
