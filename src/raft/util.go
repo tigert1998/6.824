@@ -1,6 +1,9 @@
 package raft
 
-import "log"
+import (
+	"log"
+	"sync/atomic"
+)
 
 // Debugging
 const Debug = false
@@ -24,4 +27,16 @@ func maxInt(x, y int) int {
 		return x
 	}
 	return y
+}
+
+func atomicMaxInt32(x *int32, y int32) {
+	for {
+		prevValue := atomic.LoadInt32(x)
+		if prevValue >= y {
+			break
+		}
+		if atomic.CompareAndSwapInt32(x, prevValue, y) {
+			break
+		}
+	}
 }

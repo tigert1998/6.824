@@ -1,13 +1,17 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+
+	"github.com/google/uuid"
 )
 
 const Debug = false
@@ -17,6 +21,8 @@ const (
 	APPEND = iota
 	GET    = iota
 )
+
+const APPLYLOOP_WAKEUP = 500
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -29,46 +35,227 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Op    int
-	Key   string
-	Value string
+	Op       int
+	Key      string
+	Value    string
+	ID       string
+	ClientID string
+	TS       int64
+}
+
+type lockTableItem struct {
+	ch chan bool
+	id string
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	mu        sync.Mutex
+	me        int
+	rf        *raft.Raft
+	persister *raft.Persister
+	applyCh   chan raft.ApplyMsg
+	dead      int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	dic         map[string]string
+	lockTable   map[int]lockTableItem
+	clientTable map[string]int64
+}
+
+func (kv *KVServer) applyCommand(op Op) {
+	if op.Op == GET {
+		return
+	}
+	ts, ok := kv.clientTable[op.ClientID]
+	if ok && ts >= op.TS {
+		return
+	}
+	kv.clientTable[op.ClientID] = op.TS
+	if op.Op == PUT {
+		kv.dic[op.Key] = op.Value
+	} else if op.Op == APPEND {
+		var buffer bytes.Buffer
+		value, ok := kv.dic[op.Key]
+		if ok {
+			buffer.WriteString(value)
+		}
+		buffer.WriteString(op.Value)
+		kv.dic[op.Key] = buffer.String()
+	}
+}
+
+func (kv *KVServer) releaseLockTable() {
+	for _, item := range kv.lockTable {
+		item.ch <- false
+	}
+	kv.lockTable = map[int]lockTableItem{}
+}
+
+func (kv *KVServer) getSerializedSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.dic)
+	e.Encode(kv.clientTable)
+	return w.Bytes()
+}
+
+func (kv *KVServer) readPersist(data []byte) error {
+	if data == nil || len(data) < 1 {
+		// bootstrap without any state
+		return nil
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var dic map[string]string
+	var clientTable map[string]int64
+
+	e := d.Decode(&dic)
+	if e != nil {
+		return e
+	}
+	e = d.Decode(&clientTable)
+	if e != nil {
+		return e
+	}
+	kv.dic = dic
+	kv.clientTable = clientTable
+	return nil
+}
+
+func (kv *KVServer) applyLoop() {
+	applyIndex := 0
+
+	term, isLeader := kv.rf.GetState()
+	for {
+		if kv.killed() {
+			return
+		}
+
+		var msg raft.ApplyMsg
+
+		select {
+		case <-time.After(APPLYLOOP_WAKEUP * time.Millisecond):
+			newTerm, newIsLeader := kv.rf.GetState()
+			if isLeader {
+				if newTerm != term || !newIsLeader {
+					kv.mu.Lock()
+					kv.releaseLockTable()
+					kv.mu.Unlock()
+				}
+			}
+			term = newTerm
+			isLeader = newIsLeader
+			continue
+		case msg = <-kv.applyCh:
+		}
+
+		if msg.CommandValid {
+			op := msg.Command.(Op)
+			kv.mu.Lock()
+			applyIndex = msg.CommandIndex
+			kv.applyCommand(op)
+			item, ok := kv.lockTable[msg.CommandIndex]
+			if ok {
+				if item.id == op.ID {
+					item.ch <- true
+				} else {
+					kv.releaseLockTable()
+				}
+			}
+			delete(kv.lockTable, msg.CommandIndex)
+
+			if kv.maxraftstate > 0 && kv.maxraftstate <= kv.persister.RaftStateSize() {
+				kv.rf.Snapshot(msg.CommandIndex, kv.getSerializedSnapshot())
+			}
+			kv.mu.Unlock()
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) && msg.SnapshotIndex > applyIndex {
+				kv.readPersist(msg.Snapshot)
+				applyIndex = msg.SnapshotIndex
+			}
+			kv.releaseLockTable()
+			kv.mu.Unlock()
+		}
+	}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	_, _, ok := kv.rf.Start(Op{Op: GET, Key: args.Key, Value: ""})
+	kv.mu.Lock()
+	id := uuid.New().String()
+	index, _, ok := kv.rf.Start(Op{Op: GET, Key: args.Key, ID: id})
 	if !ok {
+		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
 		return
 	}
-	_ = <-kv.applyCh
-	reply.Err = OK
+	log.Printf("[%v] Get(key: \"%v\")", kv.me, args.Key)
+
+	ch := make(chan bool)
+	kv.lockTable[index] = lockTableItem{ch: ch, id: id}
+	kv.mu.Unlock()
+
+	if <-ch {
+		reply.Err = OK
+	} else {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	var value string
+	kv.mu.Lock()
+	value, ok = kv.dic[args.Key]
+	if ok {
+		reply.Value = value
+	} else {
+		reply.Value = ""
+	}
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	op := PUT
+	var op int
 	if args.Op == "Append" {
 		op = APPEND
+	} else {
+		op = PUT
 	}
 
-	_, _, ok := kv.rf.Start(Op{Op: op, Key: args.Key, Value: args.Value})
+	kv.mu.Lock()
+	ts, ok := kv.clientTable[args.ClientID]
+	if ok && ts >= args.TS {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+
+	id := uuid.New().String()
+	index, _, ok := kv.rf.Start(Op{
+		Op:       op,
+		Key:      args.Key,
+		Value:    args.Value,
+		ID:       id,
+		ClientID: args.ClientID,
+		TS:       args.TS,
+	})
 	if !ok {
+		kv.mu.Unlock()
 		reply.Err = ErrWrongLeader
 		return
 	}
-	_ = <-kv.applyCh
-	reply.Err = OK
+	log.Printf("[%v] %v(key: \"%v\", value: \"%v\")", kv.me, args.Op, args.Key, args.Value)
+	ch := make(chan bool)
+	kv.lockTable[index] = lockTableItem{ch: ch, id: id}
+	kv.mu.Unlock()
+
+	if <-ch {
+		reply.Err = OK
+	} else {
+		reply.Err = ErrWrongLeader
+	}
 }
 
 //
@@ -117,8 +304,22 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
 
 	kv.dead = 0
+
+	log.Printf("[%v] kvserver reboots!", me)
+
+	kv.dic = map[string]string{}
+	kv.lockTable = map[int]lockTableItem{}
+	kv.clientTable = map[string]int64{}
+
+	e := kv.readPersist(persister.ReadSnapshot())
+	if e != nil {
+		log.Fatalf("%v", e)
+	}
+
+	go kv.applyLoop()
 
 	return kv
 }
