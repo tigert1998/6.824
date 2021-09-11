@@ -139,12 +139,10 @@ func (kv *KVServer) applyLoop() {
 		select {
 		case <-time.After(APPLYLOOP_WAKEUP * time.Millisecond):
 			newTerm, newIsLeader := kv.rf.GetState()
-			if isLeader {
-				if newTerm != term || !newIsLeader {
-					kv.mu.Lock()
-					kv.releaseLockTable()
-					kv.mu.Unlock()
-				}
+			if newTerm != term || newIsLeader != isLeader {
+				kv.mu.Lock()
+				kv.releaseLockTable()
+				kv.mu.Unlock()
 			}
 			term = newTerm
 			isLeader = newIsLeader
