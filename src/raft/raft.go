@@ -48,10 +48,9 @@ const (
 )
 
 const (
-	HEARTBEAT_WITH_LOG = 20
-	HEARTBEAT          = 200
-	ELECTION_BASE      = 800
-	ELECTION_RAND      = 200
+	HEARTBEAT     = 200
+	ELECTION_BASE = 800
+	ELECTION_RAND = 200
 )
 
 type ApplyMsg struct {
@@ -541,14 +540,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.roleMtx.Lock()
-	defer rf.roleMtx.Unlock()
 
+	currentTerm := rf.currentTerm
 	if rf.role != LEADER {
-		return 0, rf.currentTerm, false
+		rf.roleMtx.Unlock()
+		return 0, currentTerm, false
 	}
 
 	rf.logMtx.Lock()
-	defer rf.logMtx.Unlock()
 
 	index := rf.logLen()
 	rf.log = append(rf.log, LogEntry{
@@ -560,9 +559,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 
 	log.Printf("[term #%v] issue command [%v], index = %v", rf.currentTerm, rf.me, index)
-	currentTerm := rf.currentTerm
 
-	// rf.sendHeartBeat()
+	rf.roleMtx.Unlock()
+	rf.logMtx.Unlock()
+
+	rf.sendHeartBeat()
 
 	return index, currentTerm, true
 }
@@ -848,7 +849,7 @@ func (rf *Raft) eventLoop() {
 		}
 		_, isLeader := rf.GetState()
 		if isLeader {
-			time.Sleep(HEARTBEAT_WITH_LOG * time.Millisecond)
+			time.Sleep(HEARTBEAT * time.Millisecond)
 			rf.sendHeartBeat()
 		} else {
 			select {
