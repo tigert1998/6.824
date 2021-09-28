@@ -43,8 +43,13 @@ type Op struct {
 	TS       int64
 }
 
+type channelContent struct {
+	err   Err
+	value string
+}
+
 type lockTableItem struct {
-	ch chan bool
+	ch chan channelContent
 	id string
 }
 
@@ -64,13 +69,18 @@ type KVServer struct {
 	clientTable map[string]int64
 }
 
-func (kv *KVServer) applyCommand(op Op) {
+func (kv *KVServer) applyCommand(op Op) (string, Err) {
 	if op.Op == GET {
-		return
+		value, ok := kv.dic[op.Key]
+		if ok {
+			return value, OK
+		} else {
+			return "", ErrNoKey
+		}
 	}
 	ts, ok := kv.clientTable[op.ClientID]
 	if ok && ts >= op.TS {
-		return
+		return "", OK
 	}
 	kv.clientTable[op.ClientID] = op.TS
 	if op.Op == PUT {
@@ -84,11 +94,12 @@ func (kv *KVServer) applyCommand(op Op) {
 		buffer.WriteString(op.Value)
 		kv.dic[op.Key] = buffer.String()
 	}
+	return "", OK
 }
 
 func (kv *KVServer) releaseLockTable() {
 	for _, item := range kv.lockTable {
-		item.ch <- false
+		item.ch <- channelContent{err: ErrWrongLeader, value: ""}
 	}
 	kv.lockTable = map[int]lockTableItem{}
 }
@@ -154,11 +165,11 @@ func (kv *KVServer) applyLoop() {
 			op := msg.Command.(Op)
 			kv.mu.Lock()
 			applyIndex = msg.CommandIndex
-			kv.applyCommand(op)
+			value, err := kv.applyCommand(op)
 			item, ok := kv.lockTable[msg.CommandIndex]
 			if ok {
 				if item.id == op.ID {
-					item.ch <- true
+					item.ch <- channelContent{err: err, value: value}
 				} else {
 					kv.releaseLockTable()
 				}
@@ -192,26 +203,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	log.Printf("[%v] Get(key: \"%v\")", kv.me, args.Key)
 
-	ch := make(chan bool)
+	ch := make(chan channelContent)
 	kv.lockTable[index] = lockTableItem{ch: ch, id: id}
 	kv.mu.Unlock()
 
-	if <-ch {
-		reply.Err = OK
-	} else {
-		reply.Err = ErrWrongLeader
-		return
-	}
-
-	var value string
-	kv.mu.Lock()
-	value, ok = kv.dic[args.Key]
-	if ok {
-		reply.Value = value
-	} else {
-		reply.Value = ""
-	}
-	kv.mu.Unlock()
+	content := <-ch
+	reply.Err = content.err
+	reply.Value = content.value
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -245,15 +243,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	log.Printf("[%v] %v(key: \"%v\", value: \"%v\")", kv.me, args.Op, args.Key, args.Value)
-	ch := make(chan bool)
+	ch := make(chan channelContent)
 	kv.lockTable[index] = lockTableItem{ch: ch, id: id}
 	kv.mu.Unlock()
 
-	if <-ch {
-		reply.Err = OK
-	} else {
-		reply.Err = ErrWrongLeader
-	}
+	content := <-ch
+	reply.Err = content.err
 }
 
 //
