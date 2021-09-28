@@ -1,39 +1,270 @@
 package shardkv
 
+import (
+	"bytes"
+	"log"
+	"sync"
+	"sync/atomic"
+	"time"
 
-import "6.824/labrpc"
-import "6.824/raft"
-import "sync"
-import "6.824/labgob"
+	"6.824/shardctrler"
+	"github.com/google/uuid"
 
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
+)
 
+const QUERY_CONFIG_LOOP_INTERVAL = 100
+const APPLYLOOP_WAKEUP = 500
+
+const (
+	IRRELEVANT = iota
+	SERVING    = iota
+	SENDING    = iota
+	RECEIVING  = iota
+)
+
+const (
+	PUT    = iota
+	APPEND = iota
+	GET    = iota
+)
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Op       int
+	Key      string
+	Value    string
+	ID       string
+	ClientID string
+	TS       int64
+}
+
+type channelContent struct {
+	err   Err
+	value string
+}
+
+type lockTableItem struct {
+	ch chan channelContent
+	id string
 }
 
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
+	dead         int32
 	rf           *raft.Raft
+	persister    *raft.Persister
 	applyCh      chan raft.ApplyMsg
 	make_end     func(string) *labrpc.ClientEnd
 	gid          int
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	shardsStatus [shardctrler.NShards]int32
+	shardsTarget [shardctrler.NShards]int
+	dic          [shardctrler.NShards]map[string]string
+	lockTable    map[int]lockTableItem
+	clientTable  map[string]int64
+	config       shardctrler.Config
 }
 
+func (kv *ShardKV) applyCommand(op Op) (string, Err) {
+	shard := key2shard(op.Key)
+	if kv.shardsStatus[shard] != SERVING {
+		return "", ErrWrongGroup
+	}
+	if op.Op == GET {
+		return kv.dic[shard][op.Key], OK
+	}
+	ts, ok := kv.clientTable[op.ClientID]
+	if ok && ts >= op.TS {
+		return "", OK
+	}
+	kv.clientTable[op.ClientID] = op.TS
+	if op.Op == PUT {
+		kv.dic[shard][op.Key] = op.Value
+	} else if op.Op == APPEND {
+		var buffer bytes.Buffer
+		value, ok := kv.dic[shard][op.Key]
+		if ok {
+			buffer.WriteString(value)
+		}
+		buffer.WriteString(op.Value)
+		kv.dic[shard][op.Key] = buffer.String()
+	}
+	return "", OK
+}
+
+func (kv *ShardKV) releaseLockTable() {
+	for _, item := range kv.lockTable {
+		item.ch <- channelContent{err: ErrWrongLeader, value: ""}
+	}
+	kv.lockTable = map[int]lockTableItem{}
+}
+
+func (kv *ShardKV) getSerializedSnapshot() []byte {
+	// TODO
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.dic)
+	e.Encode(kv.clientTable)
+	return w.Bytes()
+}
+
+func (kv *ShardKV) readPersist(data []byte) error {
+	// TODO
+	if data == nil || len(data) < 1 {
+		// bootstrap without any state
+		return nil
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var dic [shardctrler.NShards]map[string]string
+	var clientTable map[string]int64
+
+	e := d.Decode(&dic)
+	if e != nil {
+		return e
+	}
+	e = d.Decode(&clientTable)
+	if e != nil {
+		return e
+	}
+	kv.dic = dic
+	kv.clientTable = clientTable
+	return nil
+}
+
+func (kv *ShardKV) applyLoop() {
+	applyIndex := 0
+
+	term, isLeader := kv.rf.GetState()
+	for {
+		if kv.killed() {
+			return
+		}
+
+		var msg raft.ApplyMsg
+
+		select {
+		case <-time.After(APPLYLOOP_WAKEUP * time.Millisecond):
+			newTerm, newIsLeader := kv.rf.GetState()
+			if newTerm != term || newIsLeader != isLeader {
+				kv.mu.Lock()
+				kv.releaseLockTable()
+				kv.mu.Unlock()
+			}
+			term = newTerm
+			isLeader = newIsLeader
+			continue
+		case msg = <-kv.applyCh:
+		}
+
+		if msg.CommandValid {
+			op := msg.Command.(Op)
+			kv.mu.Lock()
+			applyIndex = msg.CommandIndex
+			value, err := kv.applyCommand(op)
+			item, ok := kv.lockTable[msg.CommandIndex]
+			if ok {
+				if item.id == op.ID {
+					item.ch <- channelContent{err: err, value: value}
+				} else {
+					kv.releaseLockTable()
+				}
+			}
+			delete(kv.lockTable, msg.CommandIndex)
+
+			if kv.maxraftstate > 0 && kv.maxraftstate <= kv.persister.RaftStateSize() {
+				kv.rf.Snapshot(msg.CommandIndex, kv.getSerializedSnapshot())
+			}
+			kv.mu.Unlock()
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) && msg.SnapshotIndex > applyIndex {
+				kv.readPersist(msg.Snapshot)
+				applyIndex = msg.SnapshotIndex
+			}
+			kv.releaseLockTable()
+			kv.mu.Unlock()
+		}
+	}
+}
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	kv.mu.Lock()
+	if kv.shardsStatus[key2shard(args.Key)] != SERVING {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongGroup
+		return
+	}
+	id := uuid.New().String()
+	index, _, ok := kv.rf.Start(Op{Op: GET, Key: args.Key, ID: id})
+	if !ok {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		return
+	}
+	log.Printf("[%v] Get(key: \"%v\")", kv.me, args.Key)
+
+	ch := make(chan channelContent)
+	kv.lockTable[index] = lockTableItem{ch: ch, id: id}
+	kv.mu.Unlock()
+
+	content := <-ch
+	if content.err == OK {
+		reply.Err = OK
+		reply.Value = content.value
+	} else {
+		reply.Err = content.err
+	}
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	var op int
+	if args.Op == "Append" {
+		op = APPEND
+	} else {
+		op = PUT
+	}
+
+	kv.mu.Lock()
+	if kv.shardsStatus[key2shard(args.Key)] != SERVING {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongGroup
+		return
+	}
+	ts, ok := kv.clientTable[args.ClientID]
+	if ok && ts >= args.TS {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+
+	id := uuid.New().String()
+	index, _, ok := kv.rf.Start(Op{
+		Op:       op,
+		Key:      args.Key,
+		Value:    args.Value,
+		ID:       id,
+		ClientID: args.ClientID,
+		TS:       args.TS,
+	})
+	if !ok {
+		kv.mu.Unlock()
+		reply.Err = ErrWrongLeader
+		return
+	}
+	log.Printf("[%v] %v(key: \"%v\", value: \"%v\")", kv.me, args.Op, args.Key, args.Value)
+	ch := make(chan channelContent)
+	kv.lockTable[index] = lockTableItem{ch: ch, id: id}
+	kv.mu.Unlock()
+
+	content := <-ch
+	reply.Err = content.err
 }
 
 //
@@ -43,10 +274,53 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // turn off debug output from this instance.
 //
 func (kv *ShardKV) Kill() {
+	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
+func (kv *ShardKV) killed() bool {
+	return atomic.LoadInt32(&kv.dead) == 1
+}
+
+func (kv *ShardKV) queryConfigLoop() {
+	leader := 0
+	for {
+		for i := leader; ; i = (i + 1) % len(kv.ctrlers) {
+			if kv.killed() {
+				return
+			}
+			args := shardctrler.QueryArgs{Num: -1}
+			reply := shardctrler.QueryReply{}
+			ok := kv.ctrlers[i].Call("ShardCtrler.Query", &args, &reply)
+			if ok && !reply.WrongLeader {
+				leader = i
+				if reply.Config.Num != kv.config.Num {
+					kv.mu.Lock()
+					for i := 0; i < shardctrler.NShards; i++ {
+						if kv.config.Shards[i] == kv.gid && reply.Config.Shards[i] != kv.gid {
+							kv.shardsStatus[i] = SENDING
+							kv.shardsTarget[i] = reply.Config.Shards[i]
+						} else if kv.config.Shards[i] != kv.gid && reply.Config.Shards[i] == kv.gid {
+							if kv.config.Shards[i] == 0 {
+								kv.shardsStatus[i] = SERVING
+							} else {
+								kv.shardsStatus[i] = RECEIVING
+								kv.shardsTarget[i] = kv.config.Shards[i]
+							}
+						}
+					}
+					kv.config = reply.Config
+					kv.mu.Unlock()
+				}
+				break
+			}
+		}
+		if kv.killed() {
+			return
+		}
+		time.Sleep(QUERY_CONFIG_LOOP_INTERVAL * time.Millisecond)
+	}
+}
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -94,8 +368,14 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.persister = persister
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	for i := 0; i < shardctrler.NShards; i++ {
+		kv.shardsStatus[i] = IRRELEVANT
+	}
 
+	go kv.queryConfigLoop()
+	go kv.applyLoop()
 
 	return kv
 }
