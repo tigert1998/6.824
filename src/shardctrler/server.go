@@ -25,7 +25,7 @@ const (
 const APPLYLOOP_WAKEUP = 500
 
 type lockTableItem struct {
-	ch chan bool
+	ch chan channelContent
 	id string
 }
 
@@ -76,6 +76,11 @@ func (a byGID) Len() int      { return len(a) }
 func (a byGID) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 func (a byGID) Less(i, j int) bool {
 	return a[i] < a[j]
+}
+
+type channelContent struct {
+	wrongLeader bool
+	config      *Config
 }
 
 func (sc *ShardCtrler) rebalance(shards [NShards]int, groups map[int][]string) [NShards]int {
@@ -183,13 +188,19 @@ func (sc *ShardCtrler) rebalance(shards [NShards]int, groups map[int][]string) [
 	return ret
 }
 
-func (sc *ShardCtrler) applyCommand(op Op) {
+func (sc *ShardCtrler) applyCommand(op Op) (*Config, bool) {
 	if op.Op == QUERY {
-		return
+		var config Config
+		if op.Num < 0 || op.Num >= len(sc.configs) {
+			config = sc.configs[len(sc.configs)-1]
+		} else {
+			config = sc.configs[op.Num]
+		}
+		return &config, false
 	}
 	ts, ok := sc.clientTable[op.ClientID]
 	if ok && ts >= op.TS {
-		return
+		return nil, false
 	}
 	sc.clientTable[op.ClientID] = op.TS
 
@@ -216,11 +227,12 @@ func (sc *ShardCtrler) applyCommand(op Op) {
 	}
 
 	sc.configs = append(sc.configs, config)
+	return nil, false
 }
 
 func (sc *ShardCtrler) releaseLockTable() {
 	for _, item := range sc.lockTable {
-		item.ch <- false
+		item.ch <- channelContent{wrongLeader: true, config: nil}
 	}
 	sc.lockTable = map[int]lockTableItem{}
 }
@@ -285,11 +297,11 @@ func (sc *ShardCtrler) applyLoop() {
 		if msg.CommandValid {
 			op := msg.Command.(Op)
 			sc.mu.Lock()
-			sc.applyCommand(op)
+			config, wrongLeader := sc.applyCommand(op)
 			item, ok := sc.lockTable[msg.CommandIndex]
 			if ok {
 				if item.id == op.ID {
-					item.ch <- true
+					item.ch <- channelContent{wrongLeader: wrongLeader, config: config}
 				} else {
 					sc.releaseLockTable()
 				}
@@ -329,16 +341,13 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 		return
 	}
 	log.Printf("[%v] Join(servers: %v)", sc.me, args.Servers)
-	ch := make(chan bool)
+	ch := make(chan channelContent)
 	sc.lockTable[index] = lockTableItem{ch: ch, id: id}
 	sc.mu.Unlock()
 
-	if <-ch {
-		reply.WrongLeader = false
-		reply.Err = OK
-	} else {
-		reply.WrongLeader = true
-	}
+	content := <-ch
+	reply.Err = OK
+	reply.WrongLeader = content.wrongLeader
 }
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
@@ -358,16 +367,13 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 		return
 	}
 	log.Printf("[%v] Leave(gids: %v)", sc.me, args.GIDs)
-	ch := make(chan bool)
+	ch := make(chan channelContent)
 	sc.lockTable[index] = lockTableItem{ch: ch, id: id}
 	sc.mu.Unlock()
 
-	if <-ch {
-		reply.WrongLeader = false
-		reply.Err = OK
-	} else {
-		reply.WrongLeader = true
-	}
+	content := <-ch
+	reply.Err = OK
+	reply.WrongLeader = content.wrongLeader
 }
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
@@ -388,16 +394,13 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 		return
 	}
 	log.Printf("[%v] Move(shard: %v, gid: %v)", sc.me, args.Shard, args.GID)
-	ch := make(chan bool)
+	ch := make(chan channelContent)
 	sc.lockTable[index] = lockTableItem{ch: ch, id: id}
 	sc.mu.Unlock()
 
-	if <-ch {
-		reply.WrongLeader = false
-		reply.Err = OK
-	} else {
-		reply.WrongLeader = true
-	}
+	content := <-ch
+	reply.Err = OK
+	reply.WrongLeader = content.wrongLeader
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
@@ -415,25 +418,16 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 		return
 	}
 	log.Printf("[%v] Query(num: %v)", sc.me, args.Num)
-	ch := make(chan bool)
+	ch := make(chan channelContent)
 	sc.lockTable[index] = lockTableItem{ch: ch, id: id}
 	sc.mu.Unlock()
 
-	if <-ch {
-		reply.Err = OK
-		reply.WrongLeader = false
-	} else {
-		reply.WrongLeader = true
-		return
+	content := <-ch
+	reply.Err = OK
+	reply.WrongLeader = content.wrongLeader
+	if !content.wrongLeader {
+		reply.Config = *content.config
 	}
-
-	sc.mu.Lock()
-	if args.Num < 0 || args.Num >= len(sc.configs) {
-		reply.Config = sc.configs[len(sc.configs)-1]
-	} else {
-		reply.Config = sc.configs[args.Num]
-	}
-	sc.mu.Unlock()
 }
 
 //
