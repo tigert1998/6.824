@@ -340,7 +340,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 		sc.mu.Unlock()
 		return
 	}
-	log.Printf("[%v] Join(servers: %v)", sc.me, args.Servers)
+	log.Printf("[c-%v] Join(servers: %v)", sc.me, args.Servers)
 	ch := make(chan channelContent)
 	sc.lockTable[index] = lockTableItem{ch: ch, id: id}
 	sc.mu.Unlock()
@@ -366,7 +366,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 		sc.mu.Unlock()
 		return
 	}
-	log.Printf("[%v] Leave(gids: %v)", sc.me, args.GIDs)
+	log.Printf("[c-%v] Leave(gids: %v)", sc.me, args.GIDs)
 	ch := make(chan channelContent)
 	sc.lockTable[index] = lockTableItem{ch: ch, id: id}
 	sc.mu.Unlock()
@@ -393,7 +393,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 		sc.mu.Unlock()
 		return
 	}
-	log.Printf("[%v] Move(shard: %v, gid: %v)", sc.me, args.Shard, args.GID)
+	log.Printf("[c-%v] Move(shard: %v, gid: %v)", sc.me, args.Shard, args.GID)
 	ch := make(chan channelContent)
 	sc.lockTable[index] = lockTableItem{ch: ch, id: id}
 	sc.mu.Unlock()
@@ -417,7 +417,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 		sc.mu.Unlock()
 		return
 	}
-	log.Printf("[%v] Query(num: %v)", sc.me, args.Num)
+	log.Printf("[c-%v] Query(num: %v)", sc.me, args.Num)
 	ch := make(chan channelContent)
 	sc.lockTable[index] = lockTableItem{ch: ch, id: id}
 	sc.mu.Unlock()

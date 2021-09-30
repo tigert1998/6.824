@@ -43,3 +43,14 @@ type GetReply struct {
 	Err   Err
 	Value string
 }
+
+type TransferArgs struct {
+	Num   int
+	Shard int
+	KV    map[string]string
+}
+
+type TransferReply struct {
+	Success     bool
+	WrongLeader bool
+}

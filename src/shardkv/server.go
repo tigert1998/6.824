@@ -16,7 +16,10 @@ import (
 )
 
 const QUERY_CONFIG_LOOP_INTERVAL = 100
+const TRANSFER_LOOP_INTERVAL = 500
 const APPLYLOOP_WAKEUP = 500
+
+const ErrConfigNotReady = "ErrConfigNotReady"
 
 const (
 	IRRELEVANT = iota
@@ -26,18 +29,32 @@ const (
 )
 
 const (
-	PUT    = iota
-	APPEND = iota
-	GET    = iota
+	PUT       = iota
+	APPEND    = iota
+	GET       = iota
+	CONFIG    = iota
+	SHARD_PUT = iota
+	GC        = iota
 )
+
+func copyKVMap(dic *map[string]string) map[string]string {
+	ret := map[string]string{}
+	for k, v := range *dic {
+		ret[k] = v
+	}
+	return ret
+}
 
 type Op struct {
 	Op       int
 	Key      string
 	Value    string
+	Config   *shardctrler.Config
 	ID       string
 	ClientID string
 	TS       int64
+	KV       map[string]string
+	Shard    int
 }
 
 type channelContent struct {
@@ -61,16 +78,79 @@ type ShardKV struct {
 	gid          int
 	ctrlers      []*labrpc.ClientEnd
 	maxraftstate int // snapshot if log grows this big
+	mck          *shardctrler.Clerk
 
-	shardsStatus [shardctrler.NShards]int32
-	shardsTarget [shardctrler.NShards]int
-	dic          [shardctrler.NShards]map[string]string
-	lockTable    map[int]lockTableItem
-	clientTable  map[string]int64
-	config       shardctrler.Config
+	lockTable map[int]lockTableItem
+
+	shardsStatus        [shardctrler.NShards]int32
+	ownShards           [shardctrler.NShards]bool
+	nextConfigReadyFlag int32
+	dic                 [shardctrler.NShards]map[string]string
+	clientTable         map[string]int64
+	config              shardctrler.Config
+}
+
+func (kv *ShardKV) updateConfig(config shardctrler.Config) {
+	for i := 0; i < shardctrler.NShards; i++ {
+		if kv.ownShards[i] && config.Shards[i] != kv.gid {
+			kv.shardsStatus[i] = SENDING
+		} else if !kv.ownShards[i] && config.Shards[i] == kv.gid {
+			if kv.config.Shards[i] == 0 {
+				kv.shardsStatus[i] = SERVING
+				kv.ownShards[i] = true
+			} else {
+				kv.shardsStatus[i] = RECEIVING
+			}
+		}
+	}
+	kv.config = config
+	kv.checkNextConfigReady()
+}
+
+func (kv *ShardKV) checkNextConfigReady() {
+	for i := 0; i < shardctrler.NShards; i++ {
+		if kv.shardsStatus[i] == SENDING || kv.shardsStatus[i] == RECEIVING {
+			atomic.StoreInt32(&kv.nextConfigReadyFlag, 0)
+			return
+		}
+	}
+	atomic.StoreInt32(&kv.nextConfigReadyFlag, 1)
+}
+
+func (kv *ShardKV) nextConfigReady() bool {
+	return atomic.LoadInt32(&kv.nextConfigReadyFlag) == 1
 }
 
 func (kv *ShardKV) applyCommand(op Op) (string, Err) {
+	if op.Op == CONFIG {
+		if op.Config.Num == kv.config.Num+1 && kv.nextConfigReady() {
+			kv.updateConfig(*op.Config)
+			return "", OK
+		} else {
+			return "", ErrConfigNotReady
+		}
+	}
+	if op.Op == SHARD_PUT {
+		if kv.shardsStatus[op.Shard] == RECEIVING {
+			kv.shardsStatus[op.Shard] = SERVING
+			kv.dic[op.Shard] = copyKVMap(&op.KV)
+			kv.ownShards[op.Shard] = true
+
+			kv.checkNextConfigReady()
+		}
+		return "", OK
+	}
+	if op.Op == GC {
+		for i := 0; i < shardctrler.NShards; i++ {
+			if kv.shardsStatus[i] == SENDING {
+				kv.dic[i] = map[string]string{}
+				kv.shardsStatus[i] = IRRELEVANT
+				kv.ownShards[i] = false
+			}
+		}
+		kv.checkNextConfigReady()
+		return "", OK
+	}
 	shard := key2shard(op.Key)
 	if kv.shardsStatus[shard] != SERVING {
 		return "", ErrWrongGroup
@@ -108,8 +188,13 @@ func (kv *ShardKV) getSerializedSnapshot() []byte {
 	// TODO
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
+
+	e.Encode(kv.shardsStatus)
+	e.Encode(kv.ownShards)
+	e.Encode(kv.nextConfigReadyFlag)
 	e.Encode(kv.dic)
 	e.Encode(kv.clientTable)
+	e.Encode(kv.config)
 	return w.Bytes()
 }
 
@@ -122,10 +207,26 @@ func (kv *ShardKV) readPersist(data []byte) error {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
+	var shardsStatus [shardctrler.NShards]int32
+	var ownShards [shardctrler.NShards]bool
+	var nextConfigReadyFlag int32
 	var dic [shardctrler.NShards]map[string]string
 	var clientTable map[string]int64
+	var config shardctrler.Config
 
-	e := d.Decode(&dic)
+	e := d.Decode(&shardsStatus)
+	if e != nil {
+		return e
+	}
+	e = d.Decode(&ownShards)
+	if e != nil {
+		return e
+	}
+	e = d.Decode(&nextConfigReadyFlag)
+	if e != nil {
+		return e
+	}
+	e = d.Decode(&dic)
 	if e != nil {
 		return e
 	}
@@ -133,8 +234,16 @@ func (kv *ShardKV) readPersist(data []byte) error {
 	if e != nil {
 		return e
 	}
+	e = d.Decode(&config)
+	if e != nil {
+		return e
+	}
+	kv.shardsStatus = shardsStatus
+	kv.ownShards = ownShards
+	kv.nextConfigReadyFlag = nextConfigReadyFlag
 	kv.dic = dic
 	kv.clientTable = clientTable
+	kv.config = config
 	return nil
 }
 
@@ -208,7 +317,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	log.Printf("[%v] Get(key: \"%v\")", kv.me, args.Key)
+	log.Printf("[%v-%v] Get(key: \"%v\")", kv.gid, kv.me, args.Key)
 
 	ch := make(chan channelContent)
 	kv.lockTable[index] = lockTableItem{ch: ch, id: id}
@@ -258,13 +367,118 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	log.Printf("[%v] %v(key: \"%v\", value: \"%v\")", kv.me, args.Op, args.Key, args.Value)
+	log.Printf("[%v-%v] %v(key: \"%v\", value: \"%v\")", kv.gid, kv.me, args.Op, args.Key, args.Value)
 	ch := make(chan channelContent)
 	kv.lockTable[index] = lockTableItem{ch: ch, id: id}
 	kv.mu.Unlock()
 
 	content := <-ch
 	reply.Err = content.err
+}
+
+func (kv *ShardKV) Transfer(args *TransferArgs, reply *TransferReply) {
+	kv.mu.Lock()
+	if kv.config.Num != args.Num {
+		kv.mu.Unlock()
+		reply.Success = false
+		reply.WrongLeader = false
+		return
+	}
+	if kv.shardsStatus[args.Shard] == SERVING {
+		kv.mu.Unlock()
+		reply.Success = true
+		reply.WrongLeader = false
+		return
+	}
+	id := uuid.New().String()
+	index, _, ok := kv.rf.Start(Op{
+		Op:    SHARD_PUT,
+		ID:    id,
+		KV:    copyKVMap(&args.KV),
+		Shard: args.Shard,
+	})
+	if !ok {
+		kv.mu.Unlock()
+		reply.Success = false
+		reply.WrongLeader = true
+		return
+	}
+	log.Printf("[%v-%v] ShardPut(shard: %v)", kv.gid, kv.me, args.Shard)
+	ch := make(chan channelContent)
+	kv.lockTable[index] = lockTableItem{ch: ch, id: id}
+	kv.mu.Unlock()
+
+	content := <-ch
+	reply.Success = content.err == OK
+	reply.WrongLeader = content.err == ErrWrongLeader
+}
+
+func (kv *ShardKV) transferLoop() {
+	for {
+		if kv.killed() {
+			return
+		}
+		time.Sleep(QUERY_CONFIG_LOOP_INTERVAL * time.Millisecond)
+		_, isLeader := kv.rf.GetState()
+		if !isLeader {
+			continue
+		}
+		if kv.nextConfigReady() {
+			continue
+		}
+
+		sendingSet := map[int]struct{}{}
+		kv.mu.Lock()
+		for i := 0; i < shardctrler.NShards; i++ {
+			if kv.shardsStatus[i] == SENDING {
+				sendingSet[i] = struct{}{}
+			}
+		}
+		kv.mu.Unlock()
+
+		waitGroup := sync.WaitGroup{}
+		waitGroup.Add(len(sendingSet))
+
+		for i := range sendingSet {
+			go func(shard int) {
+				args := TransferArgs{
+					Num:   kv.config.Num,
+					Shard: shard,
+					KV:    copyKVMap(&kv.dic[shard]),
+				}
+				var reply TransferReply
+				group := kv.config.Groups[kv.config.Shards[shard]]
+
+				for j := 0; ; j = (j + 1) % len(group) {
+					server := kv.make_end(group[j])
+					ok := server.Call("ShardKV.Transfer", &args, &reply)
+					if ok && reply.Success {
+						waitGroup.Done()
+						return
+					}
+				}
+			}(i)
+		}
+
+		waitGroup.Wait()
+
+		kv.mu.Lock()
+		id := uuid.New().String()
+		index, _, ok := kv.rf.Start(Op{
+			Op: GC,
+			ID: id,
+		})
+		if !ok {
+			kv.mu.Unlock()
+			continue
+		}
+		log.Printf("[%v-%v] GC", kv.gid, kv.me)
+		ch := make(chan channelContent)
+		kv.lockTable[index] = lockTableItem{ch: ch, id: id}
+		kv.mu.Unlock()
+
+		<-ch
+	}
 }
 
 //
@@ -283,42 +497,43 @@ func (kv *ShardKV) killed() bool {
 }
 
 func (kv *ShardKV) queryConfigLoop() {
-	leader := 0
+	kv.mu.Lock()
+	configNum := kv.config.Num
+	kv.mu.Unlock()
 	for {
-		for i := leader; ; i = (i + 1) % len(kv.ctrlers) {
-			if kv.killed() {
-				return
-			}
-			args := shardctrler.QueryArgs{Num: -1}
-			reply := shardctrler.QueryReply{}
-			ok := kv.ctrlers[i].Call("ShardCtrler.Query", &args, &reply)
-			if ok && !reply.WrongLeader {
-				leader = i
-				if reply.Config.Num != kv.config.Num {
-					kv.mu.Lock()
-					for i := 0; i < shardctrler.NShards; i++ {
-						if kv.config.Shards[i] == kv.gid && reply.Config.Shards[i] != kv.gid {
-							kv.shardsStatus[i] = SENDING
-							kv.shardsTarget[i] = reply.Config.Shards[i]
-						} else if kv.config.Shards[i] != kv.gid && reply.Config.Shards[i] == kv.gid {
-							if kv.config.Shards[i] == 0 {
-								kv.shardsStatus[i] = SERVING
-							} else {
-								kv.shardsStatus[i] = RECEIVING
-								kv.shardsTarget[i] = kv.config.Shards[i]
-							}
-						}
-					}
-					kv.config = reply.Config
-					kv.mu.Unlock()
-				}
-				break
-			}
-		}
 		if kv.killed() {
 			return
 		}
 		time.Sleep(QUERY_CONFIG_LOOP_INTERVAL * time.Millisecond)
+		_, isLeader := kv.rf.GetState()
+		if !isLeader {
+			continue
+		}
+		if !kv.nextConfigReady() {
+			continue
+		}
+
+		config := kv.mck.Query(configNum + 1)
+
+		if config.Num == configNum+1 {
+			kv.mu.Lock()
+			id := uuid.New().String()
+			index, _, ok := kv.rf.Start(Op{Op: CONFIG, Config: &config, ID: id})
+			if !ok {
+				kv.mu.Unlock()
+				continue
+			}
+			log.Printf("[%v-%v] Config(num: %v)", kv.gid, kv.me, config.Num)
+
+			ch := make(chan channelContent)
+			kv.lockTable[index] = lockTableItem{ch: ch, id: id}
+			kv.mu.Unlock()
+
+			content := <-ch
+			if content.err == OK {
+				configNum += 1
+			}
+		}
 	}
 }
 
@@ -361,19 +576,26 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.make_end = make_end
 	kv.gid = gid
 	kv.ctrlers = ctrlers
-
-	// Your initialization code here.
-
-	// Use something like this to talk to the shardctrler:
-	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
+	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.persister = persister
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.clientTable = map[string]int64{}
+	kv.lockTable = map[int]lockTableItem{}
 	for i := 0; i < shardctrler.NShards; i++ {
+		kv.dic[i] = map[string]string{}
 		kv.shardsStatus[i] = IRRELEVANT
+		kv.ownShards[i] = false
+	}
+	kv.nextConfigReadyFlag = 1
+
+	e := kv.readPersist(persister.ReadSnapshot())
+	if e != nil {
+		log.Fatalf("%v", e)
 	}
 
+	go kv.transferLoop()
 	go kv.queryConfigLoop()
 	go kv.applyLoop()
 
