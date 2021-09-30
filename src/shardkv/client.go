@@ -15,6 +15,7 @@ import (
 
 	"6.824/labrpc"
 	"6.824/shardctrler"
+	"github.com/google/uuid"
 )
 
 //
@@ -42,7 +43,7 @@ type Clerk struct {
 	sm       *shardctrler.Clerk
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
-	// You will have to modify this struct.
+	me       string
 }
 
 //
@@ -58,7 +59,7 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck := new(Clerk)
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
-	// You'll have to add code here.
+	ck.me = uuid.NewString()
 	return ck
 }
 
@@ -107,6 +108,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
+	args.ClientID = ck.me
+	args.TS = time.Now().UnixNano()
 
 	for {
 		shard := key2shard(key)
