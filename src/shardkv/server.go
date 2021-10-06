@@ -323,11 +323,6 @@ func (kv *ShardKV) applyLoop() {
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
-	if kv.shardsStatus[key2shard(args.Key)] != SERVING {
-		kv.mu.Unlock()
-		reply.Err = ErrWrongGroup
-		return
-	}
 	id := uuid.New().String()
 	index, _, ok := kv.rf.Start(Op{Op: GET, Key: args.Key, ID: id})
 	if !ok {
@@ -359,11 +354,6 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	kv.mu.Lock()
-	if kv.shardsStatus[key2shard(args.Key)] != SERVING {
-		kv.mu.Unlock()
-		reply.Err = ErrWrongGroup
-		return
-	}
 	ts, ok := kv.clientTable[args.ClientID]
 	if ok && ts >= args.TS {
 		reply.Err = OK
@@ -470,12 +460,14 @@ func (kv *ShardKV) transferLoop() {
 				var reply TransferReply
 				group := kv.config.Groups[kv.config.Shards[shard]]
 
-				for j := 0; ; j = (j + 1) % len(group) {
-					server := kv.make_end(group[j])
-					ok := server.Call("ShardKV.Transfer", &args, &reply)
-					if ok && reply.Success {
-						waitGroup.Done()
-						return
+				for {
+					for j := 0; ; j = (j + 1) % len(group) {
+						server := kv.make_end(group[j])
+						ok := server.Call("ShardKV.Transfer", &args, &reply)
+						if ok && reply.Success {
+							waitGroup.Done()
+							return
+						}
 					}
 				}
 			}(i)
