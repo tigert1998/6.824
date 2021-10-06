@@ -45,9 +45,10 @@ type GetReply struct {
 }
 
 type TransferArgs struct {
-	Num   int
-	Shard int
-	KV    map[string]string
+	Num         int
+	Shard       int
+	KV          map[string]string
+	ClientTable map[string]int64
 }
 
 type TransferReply struct {

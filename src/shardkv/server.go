@@ -45,16 +45,40 @@ func copyKVMap(dic *map[string]string) map[string]string {
 	return ret
 }
 
+func copyClientTable(clientTable *map[string]int64) map[string]int64 {
+	ret := map[string]int64{}
+	for k, v := range *clientTable {
+		ret[k] = v
+	}
+	return ret
+}
+
+func (kv *ShardKV) updateClientTable(clientTable *map[string]int64) {
+	for k, v := range *clientTable {
+		prev, ok := kv.clientTable[k]
+		if ok {
+			if v > prev {
+				kv.clientTable[k] = v
+			} else {
+				kv.clientTable[k] = prev
+			}
+		} else {
+			kv.clientTable[k] = v
+		}
+	}
+}
+
 type Op struct {
-	Op       int
-	Key      string
-	Value    string
-	Config   *shardctrler.Config
-	ID       string
-	ClientID string
-	TS       int64
-	KV       map[string]string
-	Shard    int
+	Op          int
+	Key         string
+	Value       string
+	Config      *shardctrler.Config
+	ID          string
+	ClientID    string
+	TS          int64
+	KV          map[string]string
+	ClientTable map[string]int64
+	Shard       int
 }
 
 type channelContent struct {
@@ -134,6 +158,7 @@ func (kv *ShardKV) applyCommand(op Op) (string, Err) {
 		if kv.shardsStatus[op.Shard] == RECEIVING {
 			kv.shardsStatus[op.Shard] = SERVING
 			kv.dic[op.Shard] = copyKVMap(&op.KV)
+			kv.updateClientTable(&op.ClientTable)
 			kv.ownShards[op.Shard] = true
 
 			kv.checkNextConfigReady()
@@ -191,7 +216,6 @@ func (kv *ShardKV) getSerializedSnapshot() []byte {
 
 	e.Encode(kv.shardsStatus)
 	e.Encode(kv.ownShards)
-	e.Encode(kv.nextConfigReadyFlag)
 	e.Encode(kv.dic)
 	e.Encode(kv.clientTable)
 	e.Encode(kv.config)
@@ -209,7 +233,6 @@ func (kv *ShardKV) readPersist(data []byte) error {
 
 	var shardsStatus [shardctrler.NShards]int32
 	var ownShards [shardctrler.NShards]bool
-	var nextConfigReadyFlag int32
 	var dic [shardctrler.NShards]map[string]string
 	var clientTable map[string]int64
 	var config shardctrler.Config
@@ -219,10 +242,6 @@ func (kv *ShardKV) readPersist(data []byte) error {
 		return e
 	}
 	e = d.Decode(&ownShards)
-	if e != nil {
-		return e
-	}
-	e = d.Decode(&nextConfigReadyFlag)
 	if e != nil {
 		return e
 	}
@@ -240,7 +259,6 @@ func (kv *ShardKV) readPersist(data []byte) error {
 	}
 	kv.shardsStatus = shardsStatus
 	kv.ownShards = ownShards
-	kv.nextConfigReadyFlag = nextConfigReadyFlag
 	kv.dic = dic
 	kv.clientTable = clientTable
 	kv.config = config
@@ -378,13 +396,13 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *ShardKV) Transfer(args *TransferArgs, reply *TransferReply) {
 	kv.mu.Lock()
-	if kv.config.Num != args.Num {
+	if kv.config.Num < args.Num {
 		kv.mu.Unlock()
 		reply.Success = false
 		reply.WrongLeader = false
 		return
 	}
-	if kv.shardsStatus[args.Shard] == SERVING {
+	if kv.config.Num > args.Num || kv.shardsStatus[args.Shard] == SERVING {
 		kv.mu.Unlock()
 		reply.Success = true
 		reply.WrongLeader = false
@@ -392,10 +410,11 @@ func (kv *ShardKV) Transfer(args *TransferArgs, reply *TransferReply) {
 	}
 	id := uuid.New().String()
 	index, _, ok := kv.rf.Start(Op{
-		Op:    SHARD_PUT,
-		ID:    id,
-		KV:    copyKVMap(&args.KV),
-		Shard: args.Shard,
+		Op:          SHARD_PUT,
+		ID:          id,
+		KV:          copyKVMap(&args.KV),
+		ClientTable: copyClientTable(&args.ClientTable),
+		Shard:       args.Shard,
 	})
 	if !ok {
 		kv.mu.Unlock()
@@ -434,6 +453,7 @@ func (kv *ShardKV) transferLoop() {
 				sendingSet[i] = struct{}{}
 			}
 		}
+		clientTable := copyClientTable(&kv.clientTable)
 		kv.mu.Unlock()
 
 		waitGroup := sync.WaitGroup{}
@@ -442,9 +462,10 @@ func (kv *ShardKV) transferLoop() {
 		for i := range sendingSet {
 			go func(shard int) {
 				args := TransferArgs{
-					Num:   kv.config.Num,
-					Shard: shard,
-					KV:    copyKVMap(&kv.dic[shard]),
+					Num:         kv.config.Num,
+					Shard:       shard,
+					KV:          copyKVMap(&kv.dic[shard]),
+					ClientTable: clientTable,
 				}
 				var reply TransferReply
 				group := kv.config.Groups[kv.config.Shards[shard]]
@@ -517,6 +538,11 @@ func (kv *ShardKV) queryConfigLoop() {
 
 		if config.Num == configNum+1 {
 			kv.mu.Lock()
+			configNum = kv.config.Num
+			if config.Num != configNum+1 {
+				kv.mu.Unlock()
+				continue
+			}
 			id := uuid.New().String()
 			index, _, ok := kv.rf.Start(Op{Op: CONFIG, Config: &config, ID: id})
 			if !ok {
@@ -588,12 +614,12 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 		kv.shardsStatus[i] = IRRELEVANT
 		kv.ownShards[i] = false
 	}
-	kv.nextConfigReadyFlag = 1
 
 	e := kv.readPersist(persister.ReadSnapshot())
 	if e != nil {
 		log.Fatalf("%v", e)
 	}
+	kv.checkNextConfigReady()
 
 	go kv.transferLoop()
 	go kv.queryConfigLoop()
