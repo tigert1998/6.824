@@ -216,6 +216,7 @@ func (kv *ShardKV) getSerializedSnapshot() []byte {
 
 	e.Encode(kv.shardsStatus)
 	e.Encode(kv.ownShards)
+	e.Encode(kv.nextConfigReadyFlag)
 	e.Encode(kv.dic)
 	e.Encode(kv.clientTable)
 	e.Encode(kv.config)
@@ -233,6 +234,7 @@ func (kv *ShardKV) readPersist(data []byte) error {
 
 	var shardsStatus [shardctrler.NShards]int32
 	var ownShards [shardctrler.NShards]bool
+	var nextConfigReadyFlag int32
 	var dic [shardctrler.NShards]map[string]string
 	var clientTable map[string]int64
 	var config shardctrler.Config
@@ -242,6 +244,10 @@ func (kv *ShardKV) readPersist(data []byte) error {
 		return e
 	}
 	e = d.Decode(&ownShards)
+	if e != nil {
+		return e
+	}
+	e = d.Decode(&nextConfigReadyFlag)
 	if e != nil {
 		return e
 	}
@@ -259,6 +265,7 @@ func (kv *ShardKV) readPersist(data []byte) error {
 	}
 	kv.shardsStatus = shardsStatus
 	kv.ownShards = ownShards
+	kv.nextConfigReadyFlag = nextConfigReadyFlag
 	kv.dic = dic
 	kv.clientTable = clientTable
 	kv.config = config
