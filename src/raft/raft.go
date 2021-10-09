@@ -111,7 +111,6 @@ type Raft struct {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.roleMtx.Lock()
-	defer rf.roleMtx.Unlock()
 	rf.lastHeartBeat.Store(time.Now())
 	if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
@@ -128,6 +127,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotIndex: args.LastIncludedIndex,
 		Snapshot:      args.Data,
 	}
+	rf.roleMtx.Unlock()
 	rf.applyCh <- msg
 }
 
