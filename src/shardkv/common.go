@@ -20,10 +20,11 @@ type Err string
 
 // Put or Append
 type PutAppendArgs struct {
-	// You'll have to add definitions here.
-	Key   string
-	Value string
-	Op    string // "Put" or "Append"
+	ClientID string
+	TS       int64
+	Key      string
+	Value    string
+	Op       string // "Put" or "Append"
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
@@ -41,4 +42,16 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+
+type TransferArgs struct {
+	Num         int
+	Shard       int
+	KV          map[string]string
+	ClientTable map[string]int64
+}
+
+type TransferReply struct {
+	Success     bool
+	WrongLeader bool
 }

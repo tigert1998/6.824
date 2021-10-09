@@ -111,7 +111,6 @@ type Raft struct {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.roleMtx.Lock()
-	defer rf.roleMtx.Unlock()
 	rf.lastHeartBeat.Store(time.Now())
 	if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
@@ -128,6 +127,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotIndex: args.LastIncludedIndex,
 		Snapshot:      args.Data,
 	}
+	rf.roleMtx.Unlock()
 	rf.applyCh <- msg
 }
 
@@ -379,9 +379,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.roleMtx.Unlock()
 	rf.logMtx.Lock()
 	defer rf.logMtx.Unlock()
-	log.Printf("[term #%d] snapshot [%d], last included %v", rf.currentTerm, rf.me, index)
-	rf.trimLog(rf.getLog(index).Term, index)
-	rf.persister.SaveStateAndSnapshot(rf.getSerializedRaftState(), snapshot)
+	if index <= rf.lastIncludedIndex {
+		log.Printf("[term #%d] snapshot [%d] failed, index (%v) <= lastIncludedIndex (%v)", rf.currentTerm, rf.me, index, rf.lastIncludedIndex)
+	} else {
+		log.Printf("[term #%d] snapshot [%d], last included %v", rf.currentTerm, rf.me, index)
+		rf.trimLog(rf.getLog(index).Term, index)
+		rf.persister.SaveStateAndSnapshot(rf.getSerializedRaftState(), snapshot)
+	}
 }
 
 //
