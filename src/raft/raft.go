@@ -118,6 +118,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
+		rf.roleMtx.Unlock()
 		return
 	}
 	msg := ApplyMsg{
