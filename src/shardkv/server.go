@@ -19,8 +19,6 @@ const QUERY_CONFIG_LOOP_INTERVAL = 100
 const TRANSFER_LOOP_INTERVAL = 500
 const APPLYLOOP_WAKEUP = 500
 
-const ErrConfigNotReady = "ErrConfigNotReady"
-
 const (
 	IRRELEVANT = iota
 	SERVING    = iota
@@ -63,16 +61,20 @@ func (kv *ShardKV) updateClientTable(clientTable *map[string]int64) {
 }
 
 type Op struct {
-	Op          int
-	Key         string
-	Value       string
-	Config      *shardctrler.Config
-	ID          string
-	ClientID    string
-	TS          int64
+	Op       int
+	ID       string
+	TS       int64
+	ClientID string
+	Key      string
+	Value    string
+	// CONFIG
+	Config *shardctrler.Config
+	// SHARD_PUT
 	KV          map[string]string
 	ClientTable map[string]int64
 	Shard       int
+	// GC
+	ConfigNum int
 }
 
 type channelContent struct {
@@ -145,7 +147,7 @@ func (kv *ShardKV) applyCommand(op Op) (string, Err) {
 			kv.updateConfig(*op.Config)
 			return "", OK
 		} else {
-			return "", ErrConfigNotReady
+			return "", "ErrConfigNotReady"
 		}
 	}
 	if op.Op == SHARD_PUT {
@@ -160,6 +162,9 @@ func (kv *ShardKV) applyCommand(op Op) (string, Err) {
 		return "", OK
 	}
 	if op.Op == GC {
+		if op.ConfigNum != kv.config.Num {
+			return "", "ErrGCConfigNum"
+		}
 		for i := 0; i < shardctrler.NShards; i++ {
 			if kv.shardsStatus[i] == SENDING {
 				kv.dic[i] = map[string]string{}
@@ -445,7 +450,7 @@ func (kv *ShardKV) transferLoop() {
 			}
 		}
 		clientTable := copyClientTable(&kv.clientTable)
-
+		config := kv.config
 		kv.mu.Unlock()
 
 		waitGroup := sync.WaitGroup{}
@@ -454,13 +459,13 @@ func (kv *ShardKV) transferLoop() {
 		for k, v := range sendingSet {
 			go func(shard int, kvmap map[string]string) {
 				args := TransferArgs{
-					Num:         kv.config.Num,
+					Num:         config.Num,
 					Shard:       shard,
 					KV:          kvmap,
 					ClientTable: clientTable,
 				}
 				var reply TransferReply
-				group := kv.config.Groups[kv.config.Shards[shard]]
+				group := config.Groups[config.Shards[shard]]
 
 				for {
 					for j := 0; ; j = (j + 1) % len(group) {
@@ -480,8 +485,9 @@ func (kv *ShardKV) transferLoop() {
 		kv.mu.Lock()
 		id := uuid.New().String()
 		index, _, ok := kv.rf.Start(Op{
-			Op: GC,
-			ID: id,
+			Op:        GC,
+			ID:        id,
+			ConfigNum: config.Num,
 		})
 		if !ok {
 			kv.mu.Unlock()
