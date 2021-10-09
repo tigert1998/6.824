@@ -379,9 +379,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.roleMtx.Unlock()
 	rf.logMtx.Lock()
 	defer rf.logMtx.Unlock()
-	log.Printf("[term #%d] snapshot [%d], last included %v", rf.currentTerm, rf.me, index)
-	rf.trimLog(rf.getLog(index).Term, index)
-	rf.persister.SaveStateAndSnapshot(rf.getSerializedRaftState(), snapshot)
+	if index <= rf.lastIncludedIndex {
+		log.Printf("[term #%d] snapshot [%d] failed, index (%v) <= lastIncludedIndex (%v)", rf.currentTerm, rf.me, index, rf.lastIncludedIndex)
+	} else {
+		log.Printf("[term #%d] snapshot [%d], last included %v", rf.currentTerm, rf.me, index)
+		rf.trimLog(rf.getLog(index).Term, index)
+		rf.persister.SaveStateAndSnapshot(rf.getSerializedRaftState(), snapshot)
+	}
 }
 
 //

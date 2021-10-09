@@ -56,13 +56,7 @@ func copyClientTable(clientTable *map[string]int64) map[string]int64 {
 func (kv *ShardKV) updateClientTable(clientTable *map[string]int64) {
 	for k, v := range *clientTable {
 		prev, ok := kv.clientTable[k]
-		if ok {
-			if v > prev {
-				kv.clientTable[k] = v
-			} else {
-				kv.clientTable[k] = prev
-			}
-		} else {
+		if (ok && v > prev) || !ok {
 			kv.clientTable[k] = v
 		}
 	}
@@ -265,7 +259,7 @@ func (kv *ShardKV) readPersist(data []byte) error {
 	}
 	kv.shardsStatus = shardsStatus
 	kv.ownShards = ownShards
-	kv.nextConfigReadyFlag = nextConfigReadyFlag
+	atomic.StoreInt32(&kv.nextConfigReadyFlag, nextConfigReadyFlag)
 	kv.dic = dic
 	kv.clientTable = clientTable
 	kv.config = config
@@ -443,25 +437,26 @@ func (kv *ShardKV) transferLoop() {
 			continue
 		}
 
-		sendingSet := map[int]struct{}{}
+		sendingSet := map[int]map[string]string{}
 		kv.mu.Lock()
 		for i := 0; i < shardctrler.NShards; i++ {
 			if kv.shardsStatus[i] == SENDING {
-				sendingSet[i] = struct{}{}
+				sendingSet[i] = copyKVMap(&kv.dic[i])
 			}
 		}
 		clientTable := copyClientTable(&kv.clientTable)
+
 		kv.mu.Unlock()
 
 		waitGroup := sync.WaitGroup{}
 		waitGroup.Add(len(sendingSet))
 
-		for i := range sendingSet {
-			go func(shard int) {
+		for k, v := range sendingSet {
+			go func(shard int, kvmap map[string]string) {
 				args := TransferArgs{
 					Num:         kv.config.Num,
 					Shard:       shard,
-					KV:          copyKVMap(&kv.dic[shard]),
+					KV:          kvmap,
 					ClientTable: clientTable,
 				}
 				var reply TransferReply
@@ -477,7 +472,7 @@ func (kv *ShardKV) transferLoop() {
 						}
 					}
 				}
-			}(i)
+			}(k, v)
 		}
 
 		waitGroup.Wait()
