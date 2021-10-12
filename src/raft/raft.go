@@ -114,7 +114,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastHeartBeat.Store(time.Now())
 	if args.Term > rf.currentTerm {
 		rf.becomeFollower(args.Term)
+		rf.logMtx.RLock()
 		rf.persist()
+		rf.logMtx.RUnlock()
 	}
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
@@ -461,7 +463,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.CandidateID
 			reply.VoteGranted = true
 
+			rf.logMtx.RLock()
 			rf.persist()
+			rf.logMtx.RUnlock()
 		} else {
 			reply.VoteGranted = false
 		}
@@ -472,7 +476,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 
+		rf.logMtx.RLock()
 		rf.persist()
+		rf.logMtx.RUnlock()
 	}
 
 	if reply.VoteGranted {
@@ -565,8 +571,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	log.Printf("[term #%v] issue command [%v], index = %v", rf.currentTerm, rf.me, index)
 
-	rf.roleMtx.Unlock()
 	rf.logMtx.Unlock()
+	rf.roleMtx.Unlock()
 
 	rf.sendHeartBeat()
 
@@ -613,6 +619,7 @@ func (rf *Raft) campaign() {
 
 	rf.logMtx.RLock()
 	lastLogIndex, lastLogTerm := rf.getLogIndexTerm(0, true)
+	rf.persist()
 	rf.logMtx.RUnlock()
 
 	args := RequestVoteArgs{
@@ -621,8 +628,6 @@ func (rf *Raft) campaign() {
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
-
-	rf.persist()
 
 	log.Printf("[term #%v] [%v] starts election", campaignTerm, rf.me)
 
@@ -663,7 +668,9 @@ func (rf *Raft) campaign() {
 						rf.roleMtx.Unlock()
 					} else {
 						rf.becomeLeader()
+						rf.logMtx.RLock()
 						rf.persist()
+						rf.logMtx.RUnlock()
 						rf.roleMtx.Unlock()
 
 						rf.sendHeartBeat()
@@ -674,7 +681,9 @@ func (rf *Raft) campaign() {
 				rf.roleMtx.Lock()
 				if reply.Term > rf.currentTerm {
 					rf.becomeFollower(reply.Term)
+					rf.logMtx.RLock()
 					rf.persist()
+					rf.logMtx.RUnlock()
 				}
 				rf.roleMtx.Unlock()
 			}
@@ -727,7 +736,6 @@ func (rf *Raft) sendHeartBeat() {
 					return
 				}
 				rf.lastHeartBeats[target].Store(time.Now())
-
 				args := InstallSnapshotArgs{
 					Term:              rf.currentTerm,
 					LastIncludedIndex: rf.lastIncludedIndex,
@@ -746,7 +754,9 @@ func (rf *Raft) sendHeartBeat() {
 					} else if reply.Term > rf.currentTerm {
 						success = false
 						rf.becomeFollower(reply.Term)
+						rf.logMtx.RLock()
 						rf.persist()
+						rf.logMtx.RUnlock()
 					} else if rf.role == LEADER && rf.currentTerm == args.Term {
 						rf.matchIndex[target] = maxInt(rf.matchIndex[target], args.LastIncludedIndex)
 						rf.nextIndex[target] = rf.matchIndex[target] + 1
@@ -804,7 +814,9 @@ func (rf *Raft) sendHeartBeat() {
 						// do nothing
 					} else if reply.Term > rf.currentTerm {
 						rf.becomeFollower(reply.Term)
+						rf.logMtx.RLock()
 						rf.persist()
+						rf.logMtx.RUnlock()
 					} else if rf.role == LEADER && rf.currentTerm == args.Term {
 						if reply.Success {
 							rf.matchIndex[target] = maxInt(rf.matchIndex[target], sendLogTo-1)
@@ -818,7 +830,9 @@ func (rf *Raft) sendHeartBeat() {
 								rf.nextIndex[target] = maxInt(nextIndex, rf.matchIndex[target]+1)
 							}
 						}
+						rf.logMtx.RLock()
 						rf.persist()
+						rf.logMtx.RUnlock()
 					}
 					rf.roleMtx.Unlock()
 				}
